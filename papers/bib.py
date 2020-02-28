@@ -14,6 +14,8 @@ import re
 
 import bibtexparser
 
+from unidecode import unidecode
+
 import papers
 from papers import logger
 
@@ -33,7 +35,7 @@ from papers.duplicate import search_duplicates, list_duplicates, list_uniques, m
 
 # KEY GENERATION
 # ==============
-NAUTHOR = 2
+NAUTHOR = 1
 NTITLE = 0
 
 
@@ -76,9 +78,18 @@ def generate_key(entry, nauthor=NAUTHOR, ntitle=NTITLE, minwordlen=3, mintitlen=
         while len(u''.join(words[:ntitle])) < mintitlen and ntitle < len(words):
             ntitle += 1
         titletag = '_'.join(words[:ntitle])
-    key = authortag + yeartag + titletag
+    key = authortag.capitalize() + '_' + yeartag + titletag
     if keys and key in keys: # and not isinstance(keys, set):
         key = append_abc(key, keys)
+    return key
+ 
+
+def generate_filehead(entry, nauthor=NAUTHOR):
+    # names = bibtexparser.customization.getnames(entry.get('author','unknown').lower().split(' and '))
+    names = family_names(entry.get('author','unknown'))
+    authortag = '_'.join([nm for nm in names[:nauthor]]) 
+    yeartag = entry.get('year','0000') 
+    key = authortag + ' - ' + yeartag
     return key
  
 
@@ -382,16 +393,19 @@ class Biblio(object):
         self.add_bibtex(bibtex, **kw)
 
 
-    def add_pdf(self, pdf, attachments=None, rename=False, copy=False, search_doi=True, search_fulltext=True, scholar=False, **kw):
+    def add_pdf(self, pdf, attachments=None, rename=False, copy=False, search_doi=True, search_fulltext=True, space_digit=True, scholar=False, **kw):
+        
+        files = [pdf]
+        if attachments:
+            files += attachments
+
+        nameinfo = format_file([os.path.abspath(f) for f in files])
+        print("[dbg] name> ", nameinfo)
         
         bibtex = extract_pdf_metadata(pdf, search_doi, search_fulltext, scholar=scholar)
 
         bib = bibtexparser.loads(bibtex)
         entry = bib.entries[0]
-
-        files = [pdf]
-        if attachments:
-            files += attachments
 
         entry['file'] = format_file([os.path.abspath(f) for f in files])
         entry['ID'] = self.generate_key(entry)
@@ -460,7 +474,8 @@ class Biblio(object):
 
         files = parse_file(e.get('file',''))
         # newname = entrydir(e, root)
-        direc = os.path.join(self.filesdir, e.get('year','0000'))
+        # direc = os.path.join(self.filesdir, e.get('year','0000'))
+        direc = os.path.join(self.filesdir, '')
 
         if not files:
             logger.info('no files to rename')
@@ -472,13 +487,34 @@ class Biblio(object):
         if len(files) == 1:
             file = files[0]
             base, ext = os.path.splitext(file)
+            mypath, myfile = os.path.split(file)
             newfile = os.path.join(direc, autoname(e)+ext)
+
+            print("[dbg] title> ", e['title'])
+            newtitle = e['title'].replace('{\\\'{E}}', '')
+            print("[dbg] newtitle> ", newtitle)
+            newtitle = newtitle.replace('{\\textendash}', '')
+            print("[dbg] finaltitle> ", newtitle)
+            newtitle = newtitle.replace('{','').replace('}','').replace(':','')
+                        
+            
+            t = generate_filehead(e)
+            #print("filenamehead> ", t.capitalize())
+
+            neuefile = os.path.join(direc, t + ' - ' + newtitle+ext)
+            print("[dbg] old name> ", myfile)
+            print("[dbg] new name> ", neuefile)
+
+            donepath = os.path.join(mypath, 'done')
+            os.makedirs(donepath, exist_ok=True)
+            
             if not os.path.exists(file):
                 raise ValueError(file+': original file link is broken')
             elif file != newfile:
-                move(file, newfile, copy)
+                move(file, neuefile, copy)
+                move(file, os.path.join(donepath, myfile)) 
                 count += 1
-            newfiles = [newfile]
+            newfiles = [neuefile]
             e['file'] = format_file(newfiles)
 
 
