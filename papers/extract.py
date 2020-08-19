@@ -233,6 +233,7 @@ def fetch_json_by_doi(doi):
 def _get_page_fast(pagerequest):
     """Return the data for a page on scholar.google.com"""
     import scholarly.scholarly as scholarly
+    #from scholarly import scholarly
     resp = scholarly._SESSION.get(pagerequest, headers=scholarly._HEADERS, cookies=scholarly._COOKIES)
     if resp.status_code == 200:
         return resp.text
@@ -249,6 +250,7 @@ def _scholar_score(txt, bib):
 @cached('scholar-bibtex.json', hashed_key=True)
 def fetch_bibtex_by_fulltext_scholar(txt, assess_results=True):
     import scholarly.scholarly
+    #from scholarly import scholarly
     scholarly._get_page = _get_page_fast  # remove waiting time
     logger.debug(txt)
     search_query = scholarly.search_pubs_query(txt)

@@ -1,6 +1,6 @@
 unidecode
 crossrefapi
 bibtexparser
-scholarly
+scholarly==0.2.5
 fuzzywuzzy
 six

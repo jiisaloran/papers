@@ -30,6 +30,7 @@ from papers.config import config, bcolors, checksum, move
 
 from papers.duplicate import check_duplicates, resolve_duplicates, conflict_resolution_on_insert
 from papers.duplicate import search_duplicates, list_duplicates, list_uniques, merge_files, edit_entries
+from papers.duplicate import entry_diff
 
 # DRYRUN = False
 
@@ -430,7 +431,7 @@ class Biblio(object):
             if os.path.exists(hidden_bibtex(root)):
                 logger.debug('read from hidden bibtex')
                 try:
-                    entry = read_entry_dir(root)
+                    entry = read_entry_dir(self, root)
                     self.insert_entry(entry, **kw)
                 except Exception:  
                     logger.warn(root+'::'+str(error))
@@ -1016,7 +1017,7 @@ def main():
                 raise
                 logger.error(str(error))
                 if not o.ignore_errors:
-                    if len(o.file) or (os.isdir(file) and o.recursive)> 1: 
+                    if len(o.file) or (os.path.isdir(file) and o.recursive)> 1: 
                         logger.error('use --ignore to add other files anyway')
                     addp.exit(1)
 
@@ -1219,7 +1220,7 @@ def main():
         if o.year:
             entries = [e for e in entries if 'year' in e and match(e['year'], o.year)]
         if o.first_author:
-            first_author = lambda field : family_names(field)[0]
+            firstauthor = lambda field : family_names(field)[0]
             entries = [e for e in entries if 'author' in e and match(firstauthor(e['author']), o.author)]
         if o.author:
             author = lambda field : u' '.join(family_names(field))
@@ -1241,7 +1242,7 @@ def main():
         if o.duplicates_tit:
             entries = list_dup(entries, key=title_id)
         if o.duplicates:
-            eq = lambda a, b: a['ID'] == b['ID'] or are_duplicates(a, b, similarity=level, fuzzy_ratio=o.fuzzy_ratio)
+            eq = lambda a, b: a['ID'] == b['ID'] or are_duplicates(a, b, similarity=o.similarity, fuzzy_ratio=o.fuzzy_ratio) #level not defined, changing it to "o.similarity"!?!
             entries = list_dup(entries, eq=eq)
 
         def nfiles(e):
