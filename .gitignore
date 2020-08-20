@@ -1,4 +1,5 @@
 *.pyc
+.idea
 .tox
 .cache
 __pycache__
