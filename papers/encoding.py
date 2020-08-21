@@ -1,4 +1,3 @@
-
 import os
 import six
 import bibtexparser
@@ -15,11 +14,15 @@ if six.PY2:
 
 # fix bibtexparser call on empty strings
 _bloads_orig = bibtexparser.loads
+
+
 def _bloads_fixed(s):
     if s == '':
         return bibtexparser.bibdatabase.BibDatabase()
     else:
         return _bloads_orig(s)
+
+
 bibtexparser.loads = _bloads_fixed
 
 
@@ -68,11 +71,12 @@ def format_entries(entries):
     db.entries.extend(entries)
     return bibtexparser.dumps(db)
 
+
 # Parse name entry
 # ================
 
 def _outermost_bracket_groups(string, type='{}'):
-    '''
+    """
     >>> outermost_bracket_groups('{my name}')
     ['my name']
     >>> outermost_bracket_groups("{my nam\\'{e}}")
@@ -81,7 +85,7 @@ def _outermost_bracket_groups(string, type='{}'):
     ['my', 'name']
     >>> outermost_bracket_groups("{my} {nam\\'{e}}")
     ['my', "nam\\'{e}"]
-    '''
+    """
     l, r = type
     level = 0
     matches = []

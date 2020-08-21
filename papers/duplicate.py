@@ -7,17 +7,14 @@ import six
 from six.moves import input as raw_input
 import re
 import difflib
-
 import bibtexparser
-
-import logging
-logger = logging.getLogger(__name__)
 
 from papers.extract import isvaliddoi, fetch_entry
 from papers.encoding import parse_file, format_file, format_entries
-
 from papers.config import bcolors
 
+import logging
+logger = logging.getLogger(__name__)
 
 # SEARCH DUPLICATES
 # =================
@@ -105,13 +102,13 @@ def list_uniques(entries, **kw):
     return entries
 
 
-
 # ANALYZE DUPLICATES
 # ==================
 
-
 class ConflictingField(object):
-    def __init__(self, choices=[]):
+    def __init__(self, choices=None):
+        if choices is None:
+            choices = []
         self.choices = choices
 
     def resolve(self, force=False):
@@ -161,12 +158,12 @@ def handle_merge_conflict(merged):
     return merged
 
 
-
 class DummyBcolors:
     def __getattr__(self, s):
         return ''
-dummybcolors = DummyBcolors()
 
+
+dummybcolors = DummyBcolors()
 
 
 def _colordiffline(line, sign=None):
@@ -284,7 +281,6 @@ def entry_sdiff(entries, color=True, bcolors=bcolors, best=None):
     return '\n'.join(entry_strings)
 
 
-
 # RESOLVE DUPLICATES
 # ==================
 
@@ -297,7 +293,9 @@ def merge_files(entries):
     return format_file(files)   
 
 
-def _ask_pick_loop(entries, extra=[], select=False):
+def _ask_pick_loop(entries, extra=None, select=False):
+    if extra is None:
+        extra = []
 
     entry_choices = [str(i+1) for i in range(len(entries))]
     if select:
@@ -332,7 +330,9 @@ def _ask_pick_loop(entries, extra=[], select=False):
             continue
 
 
-def choose_entry_interactive(entries, extra=[], msg='', select=False, best=None):
+def choose_entry_interactive(entries, extra=None, msg='', select=False, best=None):
+    if extra is None:
+        extra = []
 
     print(entry_sdiff(entries, best=best))
 
@@ -343,10 +343,10 @@ def choose_entry_interactive(entries, extra=[], msg='', select=False, best=None)
     return _ask_pick_loop(entries, extra, select)
 
 
-
 def edit_entries(entries, diff=False, ndiff=False):
-    '''edit entries and insert result in database 
-    '''
+    """edit entries and insert result in database
+    """
+
     # write the listed entries to temporary file
     import tempfile
     # filename = tempfile.mktemp(prefix='.', suffix='.txt', dir=os.path.curdir)
@@ -378,10 +378,8 @@ def edit_entries(entries, diff=False, ndiff=False):
         raise ValueError('error when editing entries file: '+filename)
 
 
-
-
 def score(e):
-    ' entry score, in terms of reliability '
+    """ entry score, in terms of reliability """
     return (100*('doi' in e and isvaliddoi(e['doi'])) + 50*('title' in e) + 10*('author' in e) + 1*('file' in e))*100 + len(e)
 
 
@@ -391,6 +389,7 @@ def bestentry(entries):
 
 class DuplicateSkip(Exception):
     pass
+
 
 class DuplicateSkipAll(Exception):
     pass
@@ -475,6 +474,7 @@ class DuplicateHandler(object):
 (v)iew toggle (diff - split)
 (V)iew toggle for diff mode
 '''
+
             if not diffview:
                 msg = bcolors.OKBLUE + 'Pick entry or choose one of the following actions:'+bcolors.ENDC+txt
                 e = choose_entry_interactive(self.entries, extra=choices, msg=msg, select=True, best=self.best())
@@ -532,7 +532,6 @@ class DuplicateHandler(object):
         return self.entries
 
 
-
 def resolve_duplicates(duplicates, mode='i'):
     conflict = DuplicateHandler(duplicates)
     conflict.remove_duplicates()
@@ -565,7 +564,6 @@ def check_duplicates(entries, key=None, eq=None, issorted=False, filter_key=None
             entries.extend(itertools.chain(duplicates))        
             break
     return entries
-
 
 
 # SPECIAL CASE OF CONFLICT RESOLUTION: on insert
@@ -630,8 +628,6 @@ def conflict_resolution_on_insert(old, new, mode='i'):
         raise ValueError('conflicting entries')
 
     return resolved
-
-
 
 
 # DEPRECATED TOOLS

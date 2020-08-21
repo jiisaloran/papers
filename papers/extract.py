@@ -1,4 +1,3 @@
-from __future__ import print_function
 import os
 import json
 import six
@@ -21,6 +20,7 @@ my_etiquette = Etiquette('papers', papers.__version__, 'https://github.com/perre
 
 class DOIParsingError(ValueError):
     pass
+
 
 class DOIRequestError(ValueError):
     pass
@@ -80,7 +80,9 @@ def readpdf_image(pdf, first=None, last=None):
 
     return txt
 
+
 REGEXP = re.compile(r'[doi,doi.org/][\s\.\:]{0,2}(10\.\d{4}[\d\:\.\-\/a-z]+)[A-Z\s,\n]')
+
 
 def parse_doi(txt):
     # based on: https://doeidoei.wordpress.com/2009/10/22/regular-expression-to-match-a-doi-digital-object-identifier/
@@ -210,7 +212,6 @@ def extract_pdf_metadata(pdf, search_doi=True, search_fulltext=True, maxpages=10
     return extract_txt_metadata(txt, search_doi, search_fulltext, **kw)
 
 
-
 @cached('crossref-bibtex.json')
 def fetch_bibtex_by_doi(doi):
     url = "http://api.crossref.org/works/"+doi+"/transform/application/x-bibtex"
@@ -250,7 +251,7 @@ def _scholar_score(txt, bib):
 @cached('scholar-bibtex.json', hashed_key=True)
 def fetch_bibtex_by_fulltext_scholar(txt, assess_results=True):
     import scholarly.scholarly
-    #from scholarly import scholarly
+    # from scholarly import scholarly
     scholarly._get_page = _get_page_fast  # remove waiting time
     logger.debug(txt)
     search_query = scholarly.search_pubs_query(txt)
@@ -274,7 +275,6 @@ def fetch_bibtex_by_fulltext_scholar(txt, assess_results=True):
     else:
         raise NotImplementedError('no bibtex import linke. Make crossref request using title?')
     return bibtex
-
 
 
 def _crossref_get_author(res, sep=u'; '):
@@ -378,15 +378,14 @@ def fetch_bibtex_by_fulltext_crossref(txt, **kw):
     return crossref_to_bibtex(result).strip()
 
 
-
 def fetch_entry(e):
     if 'doi' in e and isvaliddoi(e['doi']):
         bibtex = fetch_bibtex_by_doi(e['doi'])
     else:
         kw = {}
-        if e.get('author',''):
+        if e.get('author', ''):
             kw['author'] = latex_to_unicode(family_names(e['author']))
-        if e.get('title',''):
+        if e.get('title', ''):
             kw['title'] = latex_to_unicode(family_names(e['title']))
         if kw:
             bibtex = fetch_bibtex_by_fulltext_crossref('', **kw)

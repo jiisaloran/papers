@@ -10,7 +10,7 @@ from papers import logger
 DRYRUN = False
 
 # config directory location
-HOME = os.environ.get('HOME',os.path.expanduser('~'))
+HOME = os.environ.get('HOME', os.path.expanduser('~'))
 CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', os.path.join(HOME, '.config'))
 CACHE_HOME = os.environ.get('XDG_CACHE_HOME', os.path.join(HOME, '.cache'))
 DATA_HOME = os.environ.get('XDG_DATA_HOME', os.path.join(HOME, '.local','share'))
@@ -76,7 +76,6 @@ class Config(object):
             "gitdir":self.gitdir,
             }, open(self.file, 'w'), sort_keys=True, indent=2, separators=(',', ': '))
 
-
     def load(self):
         js = json.load(open(self.file))
         self.bibtex = js.get('bibtex', self.bibtex)
@@ -84,18 +83,15 @@ class Config(object):
         self.git = js.get('git', self.git)
         self.gitdir = js.get('gitdir', self.gitdir)
 
-
     def reset(self):
         cfg = type(self)()
         self.bibtex = cfg.bibtex
         self.filesdir = cfg.filesdir
 
-
     def check_install(self):
         if not os.path.exists(self.cache):
             logger.info('make cache directory for DOI requests: '+self.cache)
             os.makedirs(self.cache)
-
 
     # make a git commit?
     @property
@@ -179,16 +175,11 @@ class Config(object):
         #         status = ' (*)' if nm == self.collection else ''
         #         lines.append('    '+nm+status)
 
-
-
         return '\n'.join(lines)
-
-
 
 
 config = Config()
 config.check_install()
-
 
 
 def cached(file, hashed_key=False):
@@ -200,6 +191,7 @@ def cached(file, hashed_key=False):
             cache = json.load(open(file))
         else:
             cache = {}
+
         def decorated(doi):
             if hashed_key: # use hashed parameter as key (for full text query)
                 if six.PY3:
@@ -217,15 +209,15 @@ def cached(file, hashed_key=False):
                     json.dump(cache, open(file,'w'))
             return res
         return decorated
+
     return decorator
-
-
 
 
 def hash_bytestr_iter(bytesiter, hasher, ashexstr=False):
     for block in bytesiter:
         hasher.update(block)
     return (hasher.hexdigest() if ashexstr else hasher.digest())
+
 
 def file_as_blockiter(afile, blocksize=65536):
     with afile:
@@ -234,13 +226,13 @@ def file_as_blockiter(afile, blocksize=65536):
             yield block
             block = afile.read(blocksize)
 
+
 def checksum(fname):
     """memory-efficient check sum (sha256)
 
     source: https://stackoverflow.com/a/3431835/2192272
     """
     return hash_bytestr_iter(file_as_blockiter(open(fname, 'rb')), hashlib.sha256())
-
 
 
 # move / copy
