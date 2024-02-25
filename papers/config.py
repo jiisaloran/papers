@@ -1,10 +1,12 @@
-import os, json, shutil
-import subprocess as sp, sys, shutil
+import os, json
+from pathlib import Path
+import subprocess as sp, sys
 import hashlib
 import bibtexparser
-import six
-from six.moves import input as raw_input
 from papers import logger
+from papers.filename import Format, NAMEFORMAT, KEYFORMAT
+from papers import __version__
+from papers.utils import bcolors, check_filesdir, search_config
 
 # GIT = False
 DRYRUN = False
@@ -15,51 +17,48 @@ CONFIG_HOME = os.environ.get('XDG_CONFIG_HOME', os.path.join(HOME, '.config'))
 CACHE_HOME = os.environ.get('XDG_CACHE_HOME', os.path.join(HOME, '.cache'))
 DATA_HOME = os.environ.get('XDG_DATA_HOME', os.path.join(HOME, '.local','share'))
 
-
-CONFIG_FILE = os.path.join(CONFIG_HOME, 'papersconfig.json')
+CONFIG_FILE_LEGACY = os.path.join(CONFIG_HOME, 'papersconfig.json')
+CONFIG_FILE = os.path.join(DATA_HOME, 'config.json')
+CONFIG_FILE_LOCAL = '.papers/config.json'
 DATA_DIR = os.path.join(DATA_HOME, 'papers')
 CACHE_DIR = os.path.join(CACHE_HOME, 'papers')
 
 
-# utils
-# -----
-
-class bcolors:
-    # https://stackoverflow.com/a/287944/2192272
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-
-
-def check_filesdir(folder):
-    folder_size = 0
-    file_count = 0
-    for (path, dirs, files) in os.walk(folder):
-      for file in files:
-        filename = os.path.join(path, file)
-        if filename.endswith('.pdf'):
-            folder_size += os.path.getsize(filename)
-            file_count += 1
-    return file_count, folder_size
-
-
-class Config(object):
+class Config:
     """configuration class to specify system-wide collections and files-dir
     """
-    def __init__(self, file=CONFIG_FILE, data=DATA_DIR, cache=CACHE_DIR,
-        bibtex=None, filesdir=None, gitdir=None, git=False):
+    def __init__(self, file=None, data=DATA_DIR,
+        bibtex=None, filesdir=None,
+        keyformat=KEYFORMAT,
+        nameformat=NAMEFORMAT,
+        editor=None,
+        gitdir=None, git=False, gitlfs=False, local=None, absolute_paths=None, backup_files=False):
         self.file = file
+        self.local = local
         self.data = data
-        self.cache = cache
-        self.filesdir = filesdir or os.path.join(data, 'files')
-        self.bibtex = bibtex  or os.path.join(data, 'papers.bib')
+        self.filesdir = filesdir
+        self.editor = editor
+        self.bibtex = bibtex
+        self.keyformat = keyformat
+        self.nameformat = nameformat
+        if absolute_paths is None:
+            absolute_paths = False if local else True
+        self.absolute_paths = absolute_paths
         self.gitdir = gitdir  or data
         self.git = git
+        self.gitlfs = gitlfs
+        self.backup_files = backup_files
+
+
+    @property
+    def editor(self):
+        return self._editor
+
+    @editor.setter
+    def editor(self, value):
+        if value is not None:
+            os.environ['EDITOR'] = value
+        self._editor = value
 
     def collections(self):
         files = []
@@ -68,76 +67,105 @@ class Config(object):
         # return sorted(f[:-4] for f in files if f.endswith('.bib'))
         return sorted(f for f in files if f.endswith('.bib'))
 
+    @property
+    def root(self):
+        if self.local and self.bibtex:
+            return Path(self.bibtex).parent.resolve()
+        else:
+            return Path(os.path.sep)
+
+    def gitcmd(self, cmd, check=True, **kw):
+        return (sp.check_call if check else sp.call)(f"git {cmd}", shell=True, cwd=self.gitdir, **kw)
+
+
+    def _relpath(self, p):
+        if p is None: return p
+        if not self.local:
+            return str(Path(p).resolve())  # abspath
+
+        # otherwise express path relative to bibtex (parent of config file)
+        try:
+            # logger.info(f"rel path: (p)", p)
+            return str((self.root / p).relative_to(self.root))
+        except Exception as error:
+            print(error)
+            logger.warn(f"config :: can't save {p} as relative path to {self.root}")
+            return p
+
+    def _abspath(self, p, root=None):
+        if p is None: return p
+        if not self.local:
+            return str(Path(p).resolve())  # abspath
+        p2 = str((Path(root).resolve() if root is not None else self.root) / p)
+        return p2
+
+
     def save(self):
         json.dump({
-            "filesdir":self.filesdir,
-            "bibtex":self.bibtex,
-            "git":self.git,
-            "gitdir":self.gitdir,
+            "filesdir": self._relpath(self.filesdir),
+            "bibtex": self._relpath(self.bibtex),
+            "gitdir": self._relpath(self.gitdir),
+            "editor": self.editor,
+            "keyformat": self.keyformat.todict(),
+            "nameformat": self.nameformat.todict(),
+            "local": self.local,
+            "absolute_paths": self.absolute_paths,
+            "git": self.git,
+            "gitlfs": self.gitlfs,
+            "backup_files": self.backup_files,
             }, open(self.file, 'w'), sort_keys=True, indent=2, separators=(',', ': '))
 
 
-    def load(self):
-        js = json.load(open(self.file))
-        self.bibtex = js.get('bibtex', self.bibtex)
-        self.filesdir = js.get('filesdir', self.filesdir)
-        self.git = js.get('git', self.git)
-        self.gitdir = js.get('gitdir', self.gitdir)
+    @classmethod
+    def load(cls, file):
+        js = json.load(open(file))
+        if 'nameformat' in js:
+            js['nameformat'] = Format(**js.get('nameformat'))
+        if 'keyformat' in js:
+            js['keyformat'] = Format(**js.get('keyformat'))
+        cfg = cls(file=file, **js)
+        cfg._update_paths_to_absolute()
+        return cfg
 
 
-    def reset(self):
-        cfg = type(self)()
-        self.bibtex = cfg.bibtex
-        self.filesdir = cfg.filesdir
+    def _update_paths_to_absolute(self):
+        if self.file is None:
+            logger.warn("_update_paths_to_absolute: only works if Config.file is defined")
+            return
+        root = Path(self.file).parent.parent
+        for field in ['bibtex', 'filesdir', 'gitdir']:
+            setattr(self, field, self._abspath(getattr(self, field), root))
 
-
-    def check_install(self):
-        if not os.path.exists(self.cache):
-            logger.info('make cache directory for DOI requests: '+self.cache)
-            os.makedirs(self.cache)
-
-
-    # make a git commit?
-    @property
-    def _gitdir(self):
-        return os.path.join(self.gitdir, '.git')
-
-    def gitinit(self, branch=None):
-        if not os.path.exists(self._gitdir):
-            # with open(os.devnull, 'w') as shutup:
-            sp.check_call(['git','init'], cwd=self.gitdir)
-        else:
-            raise ValueError('git is already initialized in '+self.gitdir)
-
-    def gitcommit(self, branch=None, message=None):
-        if os.path.exists(self._gitdir):
-            target = os.path.join(self.gitdir, os.path.basename(self.bibtex))
-            if not os.path.samefile(self.bibtex, target):
-                shutil.copy(self.bibtex, target)
-            message = message or 'save '+self.bibtex+' after command:\n\n    papers ' +' '.join(sys.argv[1:])
-            with open(os.devnull, 'w') as shutup:
-                if branch is not None:
-                    sp.check_call(['git','checkout',branch], stdout=shutup, stderr=shutup, cwd=self.gitdir)
-                sp.check_call(['git','add',target], stdout=shutup, stderr=shutup, cwd=self.gitdir)
-                res = sp.call(['git','commit','-m', message], stdout=shutup, stderr=shutup, cwd=self.gitdir)
-                if res == 0:
-                    logger.info('git commit')
-        else:
-            raise ValueError('git is not initialized in '+self.gitdir)
 
     def status(self, check_files=False, verbose=False):
 
+        def _fmt_path(p):
+            if self.local:
+                return os.path.relpath(p, ".")
+            else:
+                return p
+
         lines = []
-        lines.append(bcolors.BOLD+'papers configuration'+bcolors.ENDC)
+        if self.file and os.path.exists(self.file):
+            status = "(local)" if self.local else "(global)"
+        else:
+            status = bcolors.WARNING+"(default, not installed)"+bcolors.ENDC
+        lines.append(bcolors.BOLD+f'papers configuration {status}'+bcolors.ENDC)
+        lines.append(bcolors.BOLD+f'version {__version__}'+bcolors.ENDC)
         if verbose:
-            lines.append('* configuration file: '+self.file)
-            lines.append('* cache directory:    '+self.cache)
+            lines.append('* configuration file: '+(_fmt_path(self.file) if self.file and os.path.exists(self.file) else bcolors.WARNING+'none'+bcolors.ENDC))
+            lines.append('* cache directory:    '+CACHE_DIR)
+            lines.append('* absolute paths:     '+str(self.absolute_paths))
             # lines.append('* app data directory: '+self.data)
             lines.append('* git-tracked:        '+str(self.git))
             if self.git:
+                lines.append('* git-lfs tracked:    '+str(self.gitlfs))
                 lines.append('* git directory :     '+self.gitdir)
+            lines.append('* editor:             '+str(self.editor))
 
-        if not os.path.exists(self.filesdir):
+        if self.filesdir is None:
+            status = bcolors.WARNING+' (unset)'+bcolors.ENDC
+        elif not os.path.exists(self.filesdir):
             status = bcolors.WARNING+' (missing)'+bcolors.ENDC
         elif not os.listdir(self.filesdir):
             status = bcolors.WARNING+' (empty)'+bcolors.ENDC
@@ -147,10 +175,11 @@ class Config(object):
         else:
             status = ''
 
-        files = self.filesdir
-        lines.append('* files directory:    '+files+status)
+        lines.append(f'* files directory:    {_fmt_path(self.filesdir) if self.filesdir else self.filesdir}'+status)
 
-        if not os.path.exists(self.bibtex):
+        if self.bibtex is None:
+            status = bcolors.WARNING+' (unset)'+bcolors.ENDC
+        elif not os.path.exists(self.bibtex):
             status = bcolors.WARNING+' (missing)'+bcolors.ENDC
         elif check_files:
             try:
@@ -166,7 +195,7 @@ class Config(object):
             status = bcolors.WARNING+' (empty)'+bcolors.ENDC
         else:
             status = ''
-        lines.append('* bibtex:            '+self.bibtex+status)
+        lines.append(f'* bibtex:             {_fmt_path(self.bibtex) if self.bibtex else self.bibtex}'+status)
 
         # if verbose:
         #     collections = self.collections()
@@ -184,16 +213,16 @@ class Config(object):
         return '\n'.join(lines)
 
 
+def _init_cache():
+    if not os.path.exists(CACHE_DIR):
+        logger.info('make cache directory for DOI requests: '+CACHE_DIR)
+        os.makedirs(CACHE_DIR)
 
-
-config = Config()
-config.check_install()
-
-
+_init_cache()
 
 def cached(file, hashed_key=False):
 
-    file = os.path.join(config.cache, file)
+    file = os.path.join(CACHE_DIR, file)
 
     def decorator(fun):
         if os.path.exists(file):
@@ -202,10 +231,7 @@ def cached(file, hashed_key=False):
             cache = {}
         def decorated(doi):
             if hashed_key: # use hashed parameter as key (for full text query)
-                if six.PY3:
-                    key = hashlib.sha256(doi.encode('utf-8')).hexdigest()[:6]
-                else:
-                    key = hashlib.sha256(doi).hexdigest()[:6]
+                key = hashlib.sha256(doi.encode('utf-8')).hexdigest()[:6]
             else:
                 key = doi
             if key in cache:
@@ -218,52 +244,3 @@ def cached(file, hashed_key=False):
             return res
         return decorated
     return decorator
-
-
-
-
-def hash_bytestr_iter(bytesiter, hasher, ashexstr=False):
-    for block in bytesiter:
-        hasher.update(block)
-    return (hasher.hexdigest() if ashexstr else hasher.digest())
-
-def file_as_blockiter(afile, blocksize=65536):
-    with afile:
-        block = afile.read(blocksize)
-        while len(block) > 0:
-            yield block
-            block = afile.read(blocksize)
-
-def checksum(fname):
-    """memory-efficient check sum (sha256)
-
-    source: https://stackoverflow.com/a/3431835/2192272
-    """
-    return hash_bytestr_iter(file_as_blockiter(open(fname, 'rb')), hashlib.sha256())
-
-
-
-# move / copy
-def move(f1, f2, copy=False, interactive=True):
-    dirname = os.path.dirname(f2)
-    if dirname and not os.path.exists(dirname):
-        logger.info('create directory: '+dirname)
-        os.makedirs(dirname)
-    if f1 == f2:
-        logger.info('dest is identical to src: '+f1)
-        return
-    if os.path.exists(f2):
-        ans = raw_input('dest file already exists: '+f2+'. Replace? (y/n) ')
-        if ans != 'y':
-            return
-
-    if copy:
-        cmd = u'cp {} {}'.format(f1, f2)
-        logger.info(cmd)
-        if not DRYRUN:
-            shutil.copy(f1, f2)
-    else:
-        cmd = u'mv {} {}'.format(f1, f2)
-        logger.info(cmd)
-        if not DRYRUN:
-            shutil.move(f1, f2)

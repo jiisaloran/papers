@@ -1,6 +1,0 @@
-#!/bin/env python2.7
-import papers.bib
-
-if __name__ == '__main__':
-    papers.bib.main()
-

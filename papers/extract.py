@@ -1,11 +1,7 @@
-from __future__ import print_function
 import os
 import json
-import six
 import subprocess as sp
-import six.moves.urllib.request
 import re
-import shutil
 import tempfile
 
 from crossref.restful import Works, Etiquette
@@ -14,7 +10,8 @@ import bibtexparser
 import papers
 from papers.config import cached
 from papers import logger
-from papers.encoding import family_names, latex_to_unicode
+from papers.encoding import family_names
+from bibtexparser.customization import convert_to_unicode
 
 my_etiquette = Etiquette('papers', papers.__version__, 'https://github.com/perrette/papers', 'mahe.perrette@gmail.com')
 
@@ -30,7 +27,7 @@ class DOIRequestError(ValueError):
 # ===============================
 
 def readpdf(pdf, first=None, last=None):
-
+    # TODO the python package pdftotext can do this directly, with no temp file and no I/O.
     if not os.path.isfile(pdf):
         raise ValueError(repr(pdf) + ": not a file")
 
@@ -107,7 +104,7 @@ def parse_doi(txt):
     if doi.lower().endswith('.received'):
         doi = doi[:-len('.received')]
 
-    # quality check 
+    # quality check
     if len(doi) <= 8:
         raise DOIParsingError('failed to extract doi: '+doi)
 
@@ -123,7 +120,8 @@ def isvaliddoi(doi):
 
 
 def pdfhead(pdf, maxpages=10, minwords=200, image=False):
-    """ read pdf header
+    """
+    read pdf header
     """
     i = 0
     txt = ''
@@ -144,8 +142,8 @@ def extract_pdf_doi(pdf, image=False):
 def query_text(txt, max_query_words=200):
     # list of paragraphs
     paragraphs = re.split(r"\n\n", txt)
- 
-    # remove anything that starts with 'reference'   
+
+    # remove anything that starts with 'reference'
     query = []
     for p in paragraphs:
         if p.lower().startswith('reference'):
@@ -162,7 +160,8 @@ def query_text(txt, max_query_words=200):
 
 
 def extract_txt_metadata(txt, search_doi=True, search_fulltext=False, max_query_words=200, scholar=False):
-    """extract metadata from text, by parsing and doi-query, or by fulltext query in google scholar
+    """
+    extract metadata from text, by parsing and doi-query, or by fulltext query in google scholar
     """
     assert search_doi or search_fulltext, 'no search criteria specified for metadata'
 
@@ -178,7 +177,7 @@ def extract_txt_metadata(txt, search_doi=True, search_fulltext=False, max_query_
             logger.debug('doi query successful')
 
         except DOIParsingError as error:
-            logger.debug(u'doi parsing error: '+str(error))
+            logger.debug('doi parsing error: '+str(error))
 
         except DOIRequestError as error:
             return '''@misc{{{doi},
@@ -215,7 +214,7 @@ def extract_pdf_metadata(pdf, search_doi=True, search_fulltext=True, maxpages=10
 def fetch_bibtex_by_doi(doi):
     url = "http://api.crossref.org/works/"+doi+"/transform/application/x-bibtex"
     work = Works(etiquette=my_etiquette)
-    response = work.do_http_request('get', url, custom_header=str(work.etiquette))
+    response = work.do_http_request('get', url, custom_header={'user-agent': str(work.etiquette)})
     if response.ok:
         bibtex = response.text.strip()
         return bibtex
@@ -226,32 +225,32 @@ def fetch_bibtex_by_doi(doi):
 def fetch_json_by_doi(doi):
     url = "http://api.crossref.org/works/"+doi+"/transform/application/json"
     work = Works(etiquette=my_etiquette)
-    jsontxt = work.do_http_request('get', url, custom_header=str(work.etiquette)).text
+    jsontxt = work.do_http_request('get', url, custom_header={'user-agent': str(work.etiquette)}).text
     return jsontxt.dumps(json)
 
 
 def _get_page_fast(pagerequest):
     """Return the data for a page on scholar.google.com"""
-    import scholarly.scholarly as scholarly
+    from scholarly import scholarly
     resp = scholarly._SESSION.get(pagerequest, headers=scholarly._HEADERS, cookies=scholarly._COOKIES)
     if resp.status_code == 200:
         return resp.text
     else:
-        raise Exception('Error: {0} {1}'.format(resp.status_code, resp.reason))
+        raise Exception('Error: {} {}'.format(resp.status_code, resp.reason))
 
 
 def _scholar_score(txt, bib):
     # high score means high similarity
     from rapidfuzz.fuzz import token_set_ratio
-    return sum([token_set_ratio(bib[k], txt) for k in ['title', 'author', 'abstract'] if k in bib])
+    return sum(token_set_ratio(bib[k], txt) for k in ['title', 'author', 'abstract'] if k in bib)
 
 
 @cached('scholar-bibtex.json', hashed_key=True)
 def fetch_bibtex_by_fulltext_scholar(txt, assess_results=True):
-    import scholarly.scholarly
-    scholarly._get_page = _get_page_fast  # remove waiting time
+    from scholarly import scholarly
+    # scholarly._get_page = _get_page_fast  # remove waiting time
     logger.debug(txt)
-    search_query = scholarly.search_pubs_query(txt)
+    search_query = scholarly.search_pubs(txt)
 
     # get the most likely match of the first results
     results = list(search_query)
@@ -266,16 +265,10 @@ def fetch_bibtex_by_fulltext_scholar(txt, assess_results=True):
     else:
         result = results[0]
 
-    # use url_scholarbib to get bibtex from google
-    if getattr(result, 'url_scholarbib', ''):
-        bibtex = scholarly._get_page(result.url_scholarbib).strip()
-    else:
-        raise NotImplementedError('no bibtex import linke. Make crossref request using title?')
-    return bibtex
+    return scholarly.bibtex(result)
 
 
-
-def _crossref_get_author(res, sep=u'; '):
+def _crossref_get_author(res, sep='; '):
     return sep.join([p.get('given','') + p['family'] for p in res.get('author',[]) if 'family' in p])
 
 
@@ -299,8 +292,8 @@ def crossref_to_bibtex(r):
     bib = {}
 
     if 'author' in r:
-        family = lambda p: p['family'] if len(p['family'].split()) == 1 else u'{'+p['family']+u'}'
-        bib['author'] = ' and '.join([family(p) + ', '+ p.get('given','') 
+        family = lambda p: p['family'] if len(p['family'].split()) == 1 else '{'+p['family']+'}'
+        bib['author'] = ' and '.join([family(p) + ', '+ p.get('given','')
             for p in r.get('author',[]) if 'family' in p])
 
     # for k in ['issued','published-print', 'published-online']:
@@ -329,11 +322,9 @@ def crossref_to_bibtex(r):
     # bibtex key
     year = str(bib.get('year','0000'))
     if 'author' in r:
-        ID = r['author'][0]['family'] + u'_' + six.u(year)
+        ID = r['author'][0]['family'] + '_' + year
     else:
         ID = year
-    # if six.PY2:
-        # ID = str(''.join([c if ord(c) < 128 else '_' for c in ID]))  # make sure the resulting string is ASCII
     bib['ID'] = ID
 
     db = bibtexparser.bibdatabase.BibDatabase()
@@ -344,7 +335,7 @@ def crossref_to_bibtex(r):
 # @cached('crossref-bibtex-fulltext.json', hashed_key=True)
 def fetch_bibtex_by_fulltext_crossref(txt, **kw):
     work = Works(etiquette=my_etiquette)
-    logger.debug(six.u('crossref fulltext seach:\n')+six.u(txt))
+    logger.debug('crossref fulltext seach:\n'+txt)
 
     # get the most likely match of the first results
     # results = []
@@ -353,7 +344,7 @@ def fetch_bibtex_by_fulltext_crossref(txt, **kw):
     #     if i > 50:
     #         break
     query = work.query(txt, **kw).sort('score')
-    query_result = query.do_http_request('get', query.url, custom_header=str(query.etiquette)).text
+    query_result = query.do_http_request('get', query.url, custom_header={'user-agent':str(query.etiquette)}).text
     results = json.loads(query_result)['message']['items']
 
     if len(results) > 1:
@@ -381,14 +372,15 @@ def fetch_entry(e):
     if 'doi' in e and isvaliddoi(e['doi']):
         bibtex = fetch_bibtex_by_doi(e['doi'])
     else:
+        e = convert_to_unicode(e)
         kw = {}
         if e.get('author',''):
-            kw['author'] = latex_to_unicode(family_names(e['author']))
+            kw['author'] = family_names(e['author'])
         if e.get('title',''):
-            kw['title'] = latex_to_unicode(family_names(e['title']))
+            kw['title'] = e['title']
         if kw:
             bibtex = fetch_bibtex_by_fulltext_crossref('', **kw)
         else:
-            ValueError('no author not title field')
+            ValueError('no author nor title field')
     db = bibtexparser.loads(bibtex)
     return db.entries[0]
