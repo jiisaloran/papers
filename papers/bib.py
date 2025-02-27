@@ -1,13 +1,8 @@
 import os
 from pathlib import Path
-import logging
-# logger.basicConfig(level=logger.INFO)
-import argparse
-import subprocess as sp
 import shutil
 import bisect
-import itertools
-import fnmatch   # unix-like match
+from unidecode import unidecode as unicode_to_ascii
 import bibtexparser
 from bibtexparser.customization import convert_to_unicode
 
@@ -18,8 +13,8 @@ from papers.extract import extract_pdf_doi, isvaliddoi, parse_doi
 from papers.extract import extract_pdf_metadata
 from papers.extract import fetch_bibtex_by_fulltext_crossref, fetch_bibtex_by_doi
 
-from papers.encoding import unicode_to_latex, unicode_to_ascii
-from papers.encoding import parse_file, format_file, standard_name, family_names, format_entries, update_file_path
+from papers.encoding import parse_file, format_file, standard_name, family_names, format_entries, update_file_path, format_entry
+from papers.latexenc import unicode_to_latex, latex_to_unicode
 
 from papers.filename import NAMEFORMAT, KEYFORMAT
 from papers.utils import bcolors, checksum, move as _move
@@ -75,7 +70,7 @@ def _simplify_string(s):
     #     s = latex_to_unicode(s)
     # except Exception as error:
     #     raise
-    #     logger.warn('simplify string: failed to remove latex: '+str(error))
+    #     logger.warning('simplify string: failed to remove latex: '+str(error))
     s = _remove_unicode(s)
     return s.lower().strip()
 
@@ -198,7 +193,7 @@ class DuplicateKeyError(ValueError):
 
 class Biblio:
     """
-    main config
+    The bibtex object that we operate on, which is mainly used to read and write to dynamically, and can then send the changes to be stored in a specified bibtex file on disk.
     """
     def __init__(self, db=None, filesdir=None, key_field='ID', nameformat=NAMEFORMAT, keyformat=KEYFORMAT, similarity=DEFAULT_SIMILARITY, relative_to=None):
         """
@@ -279,14 +274,20 @@ class Biblio:
         return bisect.bisect_left(keys, self.key(entry))
 
 
-    def insert_entry(self, entry, update_key=False, check_duplicate=False, rename=False, copy=False, **checkopt):
+    def insert_entry(self, entry, update_key=False, check_duplicate=False, rename=False, copy=False, metadata={}, **checkopt):
         """
         """
+        if metadata:
+            files = self.get_files(entry) + self.get_files(metadata)
+            self.set_files(metadata, files)
+
+        if update_key:
+            entry['ID'] = self.generate_key(entry)
+
         # additional checks on DOI etc...
         if check_duplicate:
             logger.debug('check duplicates : TRUE')
-            self.insert_entry_check(entry, update_key=update_key, rename=rename, copy=copy, **checkopt)
-            return
+            return self.insert_entry_check(entry, update_key=update_key, rename=rename, copy=copy, **checkopt)
         else:
             logger.debug('check duplicates : FALSE')
 
@@ -301,26 +302,29 @@ class Biblio:
                 entry['ID'] = newkey
 
             else:
-                raise DuplicateKeyError('this error can be avoided if update_key is True')
+                print(format_entry(self, entry, prefix="New entry"))
+                print(format_entry(self, self.entries[i], prefix="Conflicts with"))
+                raise DuplicateKeyError('Key conflict. Try update_key is True or specify --key KEY explicitly')
 
         else:
             logger.info('new entry: '+self.key(entry))
 
+        print(format_entry(self, entry, prefix="Added"))
         self.entries.insert(i, entry)
 
         if rename: self.rename_entry_files(entry, copy=copy)
 
+        return [ entry ]
 
     def insert_entry_check(self, entry, update_key=False, mergefiles=True, on_conflict='i', rename=False, copy=False):
-
         duplicates = [e for e in self.entries if self.eq(e, entry)]
 
         if not duplicates:
             logger.debug('not a duplicate')
-            self.insert_entry(entry, update_key, rename=rename, copy=copy)
+            return self.insert_entry(entry, update_key, rename=rename, copy=copy)
 
 
-        elif duplicates:
+        else:
             # some duplicates...
             logger.debug('duplicate(s) found: {}'.format(len(duplicates)))
 
@@ -334,7 +338,8 @@ class Biblio:
             if entry == candidate:
                 logger.debug('exact duplicate')
                 if rename: self.rename_entry_files(candidate, copy=copy)
-                return  # do nothing
+                print(format_entry(self, entry, prefix="Existing"))
+                return [ entry ] # do nothing
 
             if update_key and entry['ID'] != candidate['ID']:
                 logger.info('duplicate :: update key to match existing entry: {} => {}'.format(entry['ID'], candidate['ID']))
@@ -352,13 +357,16 @@ class Biblio:
                 logger.debug('fixed: exact duplicate')
                 entry = candidate
                 if rename: self.rename_entry_files(candidate, copy=copy)
-                return  # do nothing
+                print(format_entry(self, entry, prefix="Existing"))
+                return [ entry ] # do nothing
 
             logger.debug('conflict resolution: '+on_conflict)
             resolved = conflict_resolution_on_insert(candidate, entry, mode=on_conflict)
             self.entries.remove(candidate) # maybe in resolved entries
+            entries = []
             for e in resolved:
-                self.insert_entry(e, update_key, rename=rename, copy=copy)
+                entries.extend( self.insert_entry(e, update_key, rename=rename, copy=copy) )
+            return entries
 
 
     def generate_key(self, entry):
@@ -375,6 +383,9 @@ class Biblio:
 
     def set_files(self, entry, files, relative_to=None):
         entry['file'] = format_file(list(sorted(set(files), key=lambda f: files.index(f))), relative_to=relative_to or self.relative_to)
+        # delete field if empty
+        if not entry['file'].strip():
+            del entry['file']
 
     def get_files(self, entry, relative_to=None):
         return parse_file(entry.get('file', ''), relative_to=relative_to or self.relative_to)
@@ -383,6 +394,7 @@ class Biblio:
         bib = bibtexparser.loads(bibtex)
         if convert_to_unicode:
             bib = bibtexparser.customization.convert_to_unicode(bib)
+        entries = []
         for e in bib.entries:
             files = []
             if "file" in e:
@@ -393,7 +405,8 @@ class Biblio:
             if files:
                 self.set_files(e, files)
 
-            self.insert_entry(e, **kw)
+            entries.extend( self.insert_entry(e, **kw) )
+        return entries
 
 
     def add_bibtex_file(self, file, **kw):
@@ -403,7 +416,8 @@ class Biblio:
 
     def fetch_doi(self, doi, **kw):
         bibtex = fetch_bibtex_by_doi(doi)
-        self.add_bibtex(bibtex, **kw)
+        kw["update_key"] = True  # fetched key is always updated
+        return self.add_bibtex(bibtex, **kw)
 
 
     def add_pdf(self, pdf, attachments=None, search_doi=True, search_fulltext=True, scholar=False, doi=None, **kw):
@@ -427,12 +441,11 @@ class Biblio:
         entry['ID'] = self.generate_key(entry)
         logger.debug('generated PDF key: '+entry['ID'])
 
-        kw.pop('update_key', True)
-            # logger.warn('fetched key is always updated when adding PDF to existing bib')
-        self.insert_entry(entry, update_key=True, **kw)
+        kw["update_key"] = False  # already updated
+        return self.insert_entry(entry, **kw)
 
 
-    def scan_dir(self, direc, search_doi=True, search_fulltext=True, **kw):
+    def scan_dir_iter(self, direc, search_doi=True, search_fulltext=True, **kw):
 
         for root, direcs, files in os.walk(direc):
             dirname = os.path.basename(root)
@@ -444,9 +457,9 @@ class Biblio:
                 logger.debug('read from hidden bibtex')
                 try:
                     entry = read_entry_dir(root, relative_to=self.relative_to)
-                    self.insert_entry(entry, **kw)
+                    yield from self.insert_entry(entry, **kw)
                 except Exception:
-                    logger.warn(root+'::'+str(error))
+                    logger.warning(root+'::'+str(error))
                 continue
 
             for file in files:
@@ -455,12 +468,16 @@ class Biblio:
                 path = os.path.join(root, file)
                 try:
                     if file.endswith('.pdf'):
-                        self.add_pdf(path, search_doi=search_doi, search_fulltext=search_fulltext, **kw)
+                        yield from self.add_pdf(path, search_doi=search_doi, search_fulltext=search_fulltext, **kw)
                     elif file.endswith('.bib'):
-                        self.add_bibtex_file(path, **kw)
+                        yield from self.add_bibtex_file(path, **kw)
                 except Exception as error:
-                    logger.warn(path+'::'+str(error))
+                    logger.warning(path+'::'+str(error))
                     continue
+
+    def scan_dir(self, direc, **kw):
+        " like scan_dir_iter but returns a list"
+        return list(self.scan_dir_iter(direc, **kw))
 
 
     def format(self):
@@ -470,7 +487,7 @@ class Biblio:
         if os.path.exists(bibtex):
             shutil.copy(bibtex, backupfile(bibtex))
         if self.relative_to not in (os.path.sep, None) and Path(self.relative_to).resolve() != Path(bibtex).parent.resolve():
-            logger.warn("Saving bibtex file with relative paths may break links. Consider using `Biblio.update_file_path(Path(bibtex).parent)` before.")
+            logger.warning("Saving bibtex file with relative paths may break links. Consider using `Biblio.update_file_path(Path(bibtex).parent)` before.")
         s = self.format()
         open(bibtex, 'w').write(s)
 
@@ -523,14 +540,19 @@ class Biblio:
             file = files[0]
             base, ext = os.path.splitext(file)
             newfile = os.path.join(direc, newname+ext)
+
             if not os.path.exists(file):
-                raise ValueError(file+': original file link is broken')
+                # raise ValueError(file+': original file link is broken')
+                logger.warning(file+': original file link is broken')
+                newfile = file
+
             elif file != newfile:
                 self.move(file, newfile, copy, hardlink=hardlink)
                 # assert os.path.exists(newfile)
                 # if not copy:
                 #     assert not os.path.exists(file)
                 count += 1
+
             newfiles = [newfile]
             self.set_files(e, newfiles, relative_to=relative_to)
 
@@ -542,7 +564,8 @@ class Biblio:
             for file in files:
                 newfile = os.path.join(newdir, os.path.basename(file))
                 if not os.path.exists(file):
-                    raise ValueError(file+': original file link is broken')
+                    logger.warning(file+': original file link is broken')
+                    newfile = file
                 elif file != newfile:
                     self.move(file, newfile, copy, hardlink=hardlink)
                     # assert os.path.exists(newfile)
@@ -591,6 +614,9 @@ class Biblio:
     def fix_entry(self, e, fix_doi=True, fetch=False, fetch_all=False,
         fix_key=False, auto_key=False, key_ascii=False, encoding=None,
         format_name=True, interactive=False):
+        """
+        Given an entry in an existing Bilio object, checks the format name and encoding.  Will fetch additional info if it's missing.
+        """
 
         e_old = e.copy()
 
@@ -618,14 +644,14 @@ class Biblio:
                                 e[k] = unicode_to_latex(e[k])
                         # except KeyError as error:
                         except (KeyError, ValueError) as error:
-                            logger.warn(e.get('ID','')+': '+k+': failed to encode: '+str(error))
+                            logger.warning(e.get('ID','')+': '+k+': failed to encode: '+str(error))
 
         if fix_doi:
             if 'doi' in e and e['doi']:
                 try:
                     doi = parse_doi('doi:'+e['doi'])
                 except:
-                    logger.warn(e.get('ID','')+': failed to fix doi: '+e['doi'])
+                    logger.warning(e.get('ID','')+': failed to fix doi: '+e['doi'])
                     return
 
                 if doi.lower() != e['doi'].lower():
@@ -644,7 +670,7 @@ class Biblio:
                 try:
                     bibtex = fetch_bibtex_by_doi(e['doi'])
                 except Exception as error:
-                    logger.warn('...failed to fetch bibtex (doi): '+str(error))
+                    logger.warning('...failed to fetch bibtex (doi): '+str(error))
 
             elif e.get('title','') and e.get('author','') and fetch_all:
                 kw = {}
@@ -654,7 +680,7 @@ class Biblio:
                 try:
                     bibtex = fetch_bibtex_by_fulltext_crossref('', **kw)
                 except Exception as error:
-                    logger.warn('...failed to fetch/update bibtex (all): '+str(error))
+                    logger.warning('...failed to fetch/update bibtex (all): '+str(error))
 
             if bibtex:
                 db = bibtexparser.loads(bibtex)
@@ -713,6 +739,9 @@ def entry_filecheck_metadata(e, file, image=False):
 
 def entry_filecheck(e, delete_broken=False, fix_mendeley=False,
     check_hash=False, check_metadata=False, interactive=True, image=False, relative_to=None):
+    """
+    Checks the bib entry file actually corresponds to an existing, correct file on disk.
+    """
 
     if 'file' not in e:
         return
@@ -742,7 +771,7 @@ def entry_filecheck(e, delete_broken=False, fix_mendeley=False,
             try:
                 file = latex_to_unicode(file)
             except KeyError as error:
-                logger.warn(e['ID']+': '+str(error)+': failed to convert latex symbols to unicode: '+file)
+                logger.warning(e['ID']+': '+str(error)+': failed to convert latex symbols to unicode: '+file)
 
             # fix root (e.g. path starts with home instead of /home)
             dirname = os.path.dirname(file)
@@ -763,11 +792,11 @@ def entry_filecheck(e, delete_broken=False, fix_mendeley=False,
             try:
                 entry_filecheck_metadata(e, file, image=image)
             except ValueError as error:
-                logger.warn(error)
+                logger.warning(error)
 
         # check existence
         if not os.path.exists(file):
-            logger.warn(e['ID']+': "{}" does not exist'.format(file)+delete_broken*' ==> delete')
+            logger.warning(e['ID']+': "{}" does not exist'.format(file)+delete_broken*' ==> delete')
             if delete_broken:
                 logger.info('delete file from entry: "{}"'.format(file))
                 continue
@@ -787,3 +816,71 @@ def entry_filecheck(e, delete_broken=False, fix_mendeley=False,
         newfiles.append(file)
 
     e['file'] = format_file(newfiles, relative_to=relative_to)
+
+
+def clean_filesdir(biblio, interactive=True, ignore_files=None, ignore_folders=None):
+    if biblio.filesdir is None:
+        raise ValueError('filesdir is not defined, cannot clean')
+    removed_files = []
+
+    allfiles = set(os.path.abspath(file) for e in biblio.entries for file in biblio.get_files(e))
+    if ignore_files:
+        for f in ignore_files:
+            allfiles.add(os.path.abspath(f))
+    allfolders = set(os.path.abspath(folder) for e in biblio.entries for folder in {os.path.dirname(file) for file in biblio.get_files(e)})
+
+    if ignore_folders is None:
+        ignore_folders = []
+
+    for root, direcs, files in os.walk(biblio.filesdir):
+
+        ANS = None  # Y(es) or N(o) for all files in this folder (reset at each pass)
+        if root in ignore_folders:
+            continue
+        if '.git' in root.split(os.path.sep):
+            continue
+        for file in files:
+            path = os.path.abspath(os.path.join(root, file))
+            if file.startswith('.') or file.endswith('.bib'):
+                continue
+            if path not in allfiles:
+                if interactive:
+                    if ANS is None:
+                        ans = input(f"File: {os.path.relpath(path, biblio.filesdir)} not in library. Remove ? [Y/n/Y/N] ")
+                    else:
+                        ans = ANS
+                    if ans in ['Y', 'N']:
+                        ans = ANS = ans.lower()  # same reply for all files in this folder
+                    if ans.lower() == 'y':
+                        os.remove(path)
+                        removed_files.append(path)
+                else:
+                    logger.info(f"Remove unlinked file {os.path.relpath(path, biblio.filesdir)}.")
+                    os.remove(path)
+                    removed_files.append(path)
+
+        for direc in direcs:
+            if direc.startswith('.'):
+                continue
+            if direc in ignore_folders:
+                continue
+
+            # Check multifile entries
+            bibtex = os.path.join(root, direc, '.'+direc+'.bib')
+            if not os.path.exists(bibtex):
+                continue
+
+            direcpath = os.path.abspath(os.path.join(root, direc))
+
+            if direcpath not in allfolders:
+                if interactive:
+                    ans = input(f"Folder: {os.path.relpath(direcpath, root)} not in library. Remove ? [Y/n] ")
+                    if ans.lower() == 'y':
+                        shutil.rmtree(os.path.join(root, direcpath))
+                else:
+                    logger.info(f"Remove folder {direc}.")
+                    shutil.rmtree(os.path.join(root, direcpath))
+
+        break
+
+    return removed_files

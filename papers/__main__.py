@@ -1,4 +1,4 @@
-"""That is the script called by papers
+"""That is the script called by the papers cli command
 """
 import os
 import sys
@@ -13,24 +13,44 @@ import fnmatch   # unix-like match
 import papers
 from papers import logger
 from papers.extract import extract_pdf_doi, isvaliddoi, extract_pdf_metadata
-from papers.extract import fetch_bibtex_by_doi
-from papers.encoding import parse_file, format_file, family_names, format_entries
-from papers.config import bcolors, Config, search_config, CONFIG_FILE, CONFIG_FILE_LOCAL, DATA_DIR, CONFIG_FILE_LEGACY
+from papers.extract import fetch_bibtex_by_doi, fetch_bibtex_by_fulltext_crossref, fetch_bibtex_by_fulltext_scholar
+from papers.encoding import parse_file, format_file, family_names, format_entries, standard_name, format_entry, parse_keywords, format_key
+from papers.config import bcolors, Config, search_config, CONFIG_FILE, CONFIG_FILE_LOCAL, DATA_DIR, CONFIG_FILE_LEGACY, BACKUP_DIR
 from papers.duplicate import list_duplicates, list_uniques, edit_entries
-from papers.bib import Biblio, FUZZY_RATIO, DEFAULT_SIMILARITY, entry_filecheck, backupfile, isvalidkey
+from papers.bib import (Biblio, FUZZY_RATIO, DEFAULT_SIMILARITY, entry_filecheck,
+                        backupfile as backupfile_func, isvalidkey, DuplicateKeyError, clean_filesdir)
+from papers.utils import move, checksum, view_pdf, open_folder
 from papers import __version__
 
 
-def check_legacy_config(configfile):
-    " move config file from ~/.config/papersconfig.json to ~/.local/.share/papers/ "
-    if not os.path.exists(configfile) and os.path.exists(CONFIG_FILE_LEGACY):
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+if os.path.exists(CONFIG_FILE_LEGACY):
+    # move config file from ~/.local/.share/papers/ to ~/.config/papersconfig.json .papers/config.json to .papersconfig.json"
+    if not os.path.exists(CONFIG_FILE):
+        logger.warning(f"Move legacy config file {CONFIG_FILE_LEGACY} to {CONFIG_FILE}'")
         shutil.move(CONFIG_FILE_LEGACY, CONFIG_FILE)
-        configfile = CONFIG_FILE
+    else:
+        logger.warning(f"Legacy config file found: {CONFIG_FILE_LEGACY}. Delete to remove this warning:  rm -f '{CONFIG_FILE_LEGACY}'")
+
+def check_legacy_config(configfile):
+    " move config file from ~/.local/.share/papers/ to ~/.config/papersconfig.json and .papers/config.json to .papersconfig.json"
+    if os.path.exists(configfile):
+        p = Path(configfile)
+        if configfile == CONFIG_FILE_LEGACY:
+            shutil.move(configfile, CONFIG_FILE)
+            configfile = CONFIG_FILE
+        elif p.name == "config.json" and p.parent.name == ".papers":
+            newname = str(p.parent.parent/CONFIG_FILE_LOCAL)
+            shutil.move(configfile, newname)
+            configfile = newname
+
     return configfile
 
 
 def get_biblio(config):
+    """
+    This function initializes a Biblio object based on the bibtex file specified as command line argument or in config file.
+    If no bibtex file is specified, it raises a ValueError().
+    """
     if config.bibtex is None:
         raise ValueError('bibtex is not initialized')
     relative_to = os.path.sep if config.absolute_paths else (os.path.dirname(config.bibtex) if config.bibtex else None)
@@ -44,91 +64,157 @@ def get_biblio(config):
 
 
 def _backup_bib(biblio, config, message=None):
+    if not config.git:
+        raise PapersExit('cannot backup without --git enabled')
     # backupdir = Path(config.file).parent
     backupdir = Path(config.gitdir)
     backupdir.mkdir(exist_ok=True)
-    backupfile = backupdir/'papers.bib'
 
     # remove if exists
-    backupfile.unlink(missing_ok=True)
+    config.backupfile.unlink(missing_ok=True)
+    config.backupfile_clean.unlink(missing_ok=True)
 
     ## Here we could create a copy of biblio since it is modified in place
     ## For now, we exit the program after saving, so don't bother
+    logger.debug(f'BACKUP: cp {config.bibtex} {config.backupfile}')
+    shutil.copy(config.bibtex, config.backupfile)
+    config.gitcmd(f"add {config.backupfile.name}")
+
     if config.backup_files:
         logger.info('backup bibliography with files')
         backupfilesdir = backupdir/"files"
         backupfilesdir.mkdir(exist_ok=True)
         biblio.filesdir = str(backupfilesdir)
         biblio.rename_entries_files(copy=True, relative_to=backupdir, hardlink=True)
-        biblio.save(backupfile)
-        config.gitcmd(f"add papers.bib")
+        biblio.save(config.backupfile_clean)
+        config.gitcmd(f"add {config.backupfile_clean.name}")
+
+        # Remove unlink files
+        clean_filesdir(biblio, interactive=False, ignore_files=[config.backupfile, config.backupfile_clean])
         config.gitcmd(f"add files")
 
     else:
         logger.info('backup bibliography only (without files)')
         biblio.update_file_path(relative_to=backupdir)
-        biblio.save(backupfile)
-        config.gitcmd(f"add papers.bib", check=False)
+        biblio.save(config.backupfile_clean)
+        config.gitcmd(f"add {config.backupfile_clean.name}")
 
     message = message or f'papers ' +' '.join(sys.argv[1:])
     res = config.gitcmd(f"commit -m '{message}'", check=False)
-    config.gitcmd(f"clean -f")   # will also clean future files
+    # work on "main" branch for comitting (out of history branch)
+    config.gitcmd(f"checkout -B main")
+    config.gitcmd(f"clean -f")
 
-def _restore_from_backupdir(config):
-    logger.info('restore bibliography')
-    # copy the files to the working directory
-    # backupdir = Path(config.file).parent
-    backupdir = Path(config.gitdir)
-    backupfile = backupdir/'papers.bib'
+def _silent_backup_bib(biblio, config, level=logging.WARNING, *args, **kwargs):
+    " this is useful when passing --info to avoid having too many outputs"
+    level0 = logger.getEffectiveLevel()
+    if level0 > logging.DEBUG: # if DEBUG, also show back debug logs
+        logger.setLevel(level)
+    _backup_bib(biblio, config, *args, **kwargs)
+    logger.setLevel(level0)
+
+
+def _restore_from_backupdir(config, restore_files=False):
+    restore_cmd = f"papers add {config.backupfile_clean} --rename --copy" if config.backup_files else f"cp {config.backupfile} {config.bibtex}"
+    repair_message = f"papers backup broken :: cannot repair file links :: try to recover manually with `{restore_cmd}`"
+    try:
+        return _restore_from_backupdir_wrapped(config, restore_files=restore_files)
+    except Exception as error:
+        raise
+        logger.error(str(error))
+        raise PapersExit(repair_message)
+
+
+def _restore_from_backupdir_wrapped(config, restore_files=False):
+    # current = sp.check_output(f"git rev-parse --short HEAD", shell=True, cwd=config.gitdir).strip().decode()
+    current = sp.check_output(f"git rev-parse HEAD", shell=True, cwd=config.gitdir).strip().decode()
+    message = sp.check_output(f"git log {current} --pretty='format:%C(auto)%h %s (%ad)' -1", shell=True, cwd=config.gitdir).strip().decode()
+    logger.info(f'restore bibliography to {message}')
+
     if os.path.exists(config.bibtex):
         os.remove(config.bibtex)
-    open(config.bibtex, 'w').write('')
-    if config.backup_files:
-        cmd = f"add {backupfile} --bibtex {config.bibtex} --filesdir {config.filesdir} --rename --copy --no-git"
-    else:
-        cmd = f"add {backupfile} --bibtex {config.bibtex} --filesdir {config.filesdir} --no-git"
-    # return sp.check_call(f"PYTHONPATH={Path(papers.__file__).parent.parent} python3 -m papers {cmd}", shell=True)
-    # Here we avoid starting a new process with re-importing python libs etc
-    logger.info("papers "+cmd)
-    main(cmd.split())
+    shutil.copy(config.backupfile, config.bibtex)
 
-def _git_undo(config):
-    """papers undo using git backup"""
-    # backupdir = Path(config.file).parent
-    backupdir = Path(config.gitdir)
-    backupfile = backupdir/'papers.bib'
-    # keep track of where we come from, for future redos
-    current = sp.check_output(f"git rev-parse HEAD", shell=True, cwd=backupdir).strip().decode()
-    #  now go back
-    config.gitcmd(f"reset --hard HEAD^")
-    futuresfile = backupdir/"futures.txt"
-    open(futuresfile, 'a+').write(current+"\n")
-    _restore_from_backupdir(config)
-
-def _git_redo(config):
-    """papers redo using git backup"""
-    # backupdir = Path(config.file).parent
-    backupdir = Path(config.gitdir)
-    backupfile = backupdir/'papers.bib'
-    # keep track of where we come from, for future redos
-    futuresfile = backupdir/"futures.txt"
-    try:
-        futures = open(futuresfile, 'r').readlines()
-        last = futures[-1].strip()
-    except:
-        last = ""
-    if not last:
-        logger.info("Nothing to redo")
+    # Re-name the file according to back-up bibtex
+    if not config.backup_files:
         return
 
-    config.gitcmd(f"reset --hard {last}")
-    futures = futures[:-1]
-    if futures:
-        open(futuresfile, 'w').write("\n".join(futures))
-    else:
-        futuresfile.unlink()
+    biblio = Biblio.load(config.bibtex, config.filesdir)
+    biblio_clean = Biblio.load(config.backupfile_clean, config.filesdir)
 
-    _restore_from_backupdir(config)
+    assert len(biblio.entries) == len(biblio_clean.entries)
+
+    for e, e_clean in zip(biblio.entries, biblio_clean.entries):
+        assert e['ID'] == e_clean['ID'], f"{e['ID']} != {e_clean['ID']})"
+        files = biblio.get_files(e)
+        files_clean = biblio_clean.get_files(e_clean)
+        assert len(files) == len(files_clean), f"{e['ID']} :: files {len(files)} != {len(files_clean)})"
+
+        new_files = []
+
+        for f, f_clean in zip(files, files_clean):
+            # broken link in the backup
+            if not os.path.exists(f_clean):
+                logger.debug(f"BACKUP FILE DOES NOT EXISTS: {f_clean} ")
+                logger.debug(f"BACKUP ENTRY: {e_clean['file']} ")
+                logger.debug(f"BROKEN ENTRY: {e['file']} ")
+                logger.warning(f"{e['ID']} :: file link broken => {f} ")
+                new_files.append(f)
+                continue
+
+            # backup file is fine
+
+            # original bibtex link matches something on disk
+            if os.path.exists(f):
+
+                # same file: nothing to do
+                if os.path.samefile(f, f_clean) or checksum(f_clean) == checksum(f):
+                    new_files.append(f)
+
+                else:
+                    logger.warning(f"{e['ID']} :: file found but does not match backup (keep pointer to backup): {f} != {f_clean}")
+                    new_files.append(f_clean)
+
+            # original bibtex link is broken, --restore-file is active
+            elif restore_files:
+                try:
+                    move(f_clean, f, copy=True, interactive=False)
+                    new_files.append(f)
+
+                except Exception as error:
+                    logger.error(f"{error}")
+                    logger.error(f"{e['ID']} :: failed to restore file (keep pointer to backup)")
+                    new_files.append(f_clean)
+                    pass
+
+            # original bibtex link is broken, default without --restore-file : do not do anything
+            else:
+                new_files.append(f_clean)
+
+        biblio.set_files(e, new_files)
+
+    biblio.save(config.bibtex)
+
+
+def _git_reset_to_commit(config, commit, restore_files=False):
+    config.gitcmd(f"reset --hard {commit}")
+    _restore_from_backupdir(config, restore_files=restore_files)
+
+
+def _git_undo(config, restore_files=False, steps=1):
+    sp.check_call(f"git checkout -B history", shell=True, cwd=config.gitdir)
+    _git_reset_to_commit(config, 'HEAD'+'^'*steps, restore_files=restore_files)
+    # _git_reset_to_commit(config, 'HEAD^', restore_files=o.restore_files)
+
+
+def _git_redo(config, restore_files=False, steps=1):
+    current = sp.check_output(f"git rev-parse HEAD", shell=True, cwd=config.gitdir).strip().decode()
+    futures = sp.check_output(f"git rev-list {current}..main", shell=True, cwd=config.gitdir).strip().decode().splitlines()[::-1]
+    try:
+        future = futures[steps-1]
+    except Exception as error:
+        raise PapersExit("nothing to redo")
+    _git_reset_to_commit(config, future, restore_files=restore_files)
 
 
 def savebib(biblio, config):
@@ -142,15 +228,43 @@ def savebib(biblio, config):
     if biblio is not None:
         biblio.save(config.bibtex)
     if config.file and config.git:
-        _backup_bib(biblio, config)
+        _silent_backup_bib(biblio, config)
+    else:
+        logger.debug(f'do not backup bib: {config.file}, {config.git}')
     # if config.git:
         # config.gitcommit()
+
+
+
+def is_subdirectory(parent, child):
+    # Resolve paths to absolute paths
+    parent = Path(parent).resolve()
+    child = Path(child).resolve()
+
+    # Check if the child path is relative to the parent path
+    return parent in child.parents
+
+
+def view_entry_files(biblio, entry):
+    files = biblio.get_files(entry)
+
+    # in case several attachments are present and the files are ordered under filesdir,
+    # open the subfolder instead of the single files
+    if len(files) > 1:
+        parent = os.path.commonpath(files)
+        if is_subdirectory(biblio.filesdir, parent):
+            open_folder(parent)
+            return
+
+    for f in biblio.get_files(entry):
+        logger.info(f"opening {f} ...")
+        view_pdf(f)
 
 
 def set_keyformat_config_from_cmd(o, config):
     """
     Given options and a config state, applies the desired key options to the config.
-    """    
+    """
     config.keyformat.template = o.key_template
     config.keyformat.author_num = o.key_author_num
     config.keyformat.author_sep = o.key_author_sep
@@ -186,12 +300,18 @@ def installcmd(parser, o, config):
         o.edit = ans.lower() == 'e'
 
     if not o.edit:
+        if config.local and os.path.exists(config.file):
+            # if we don't do that the local install will take precedence over global install
+            logger.warning(f"remove pre-existing local configuration file: {config.file}")
+            os.remove(config.file)
         config = Config()
 
     if o.local is None:
         if config.local is not None:
+            logger.debug(f'keep config to pre-existing: {config.local}')
             o.local = config.local
         else:
+            logger.debug(f'default to global config')
             # default ?
             o.local = False
 
@@ -206,8 +326,7 @@ def installcmd(parser, o, config):
         papersconfig = config.file or CONFIG_FILE_LOCAL
         workdir = Path('.')
         bibtex_files = [str(f) for f in sorted(workdir.glob("*.bib"))]
-        config.gitdir = config.data = os.path.dirname(papersconfig)
-        
+
         if o.absolute_paths is None:
             o.absolute_paths = False
 
@@ -216,7 +335,7 @@ def installcmd(parser, o, config):
         workdir = Path(DATA_DIR)
         bibtex_files = [str(f) for f in sorted(Path('.').glob("*.bib"))] + [str(f) for f in sorted(workdir.glob("*.bib"))]
         checkdirs = [os.path.join(DATA_DIR, "files")] + checkdirs
-        
+
         if o.absolute_paths is None:
             o.absolute_paths = True
 
@@ -271,16 +390,25 @@ def installcmd(parser, o, config):
     config.bibtex = o.bibtex
     config.filesdir = o.filesdir
     config.file = papersconfig
-    config.gitdir = config.data = os.path.dirname(config.file)
     config.local = o.local
     config.absolute_paths = o.absolute_paths
+
+    # Unless otherwise specified (option not advertized -- help suppressed)
+    # the git directory is centralized in the back up dir.
+    if o.gitdir:
+        config.gitdir = o.gitdir
+
+    elif config.bibtex is not None:
+        from normality import slugify
+        bibi = config.bibtex[:-len(".bib")] if config.bibtex.endswith(".bib") else config.bibtex
+        config.gitdir = os.path.join(BACKUP_DIR, slugify(bibi))
 
     if o.editor:
         config.editor = o.editor
 
     # create bibtex file if not existing
     bibtex = Path(o.bibtex) if o.bibtex else None
-    
+
     if bibtex and not bibtex.exists():
         logger.info(f'create empty bibliography database: {bibtex}')
         bibtex.parent.mkdir(parents=True, exist_ok=True)
@@ -325,32 +453,27 @@ def installcmd(parser, o, config):
     config.backup_files = config.gitlfs
 
     logger.info('save config file: '+config.file)
-    os.makedirs(os.path.dirname(config.file), exist_ok=True)
+    if os.path.dirname(config.file):
+        # typically is current dir = ""
+        os.makedirs(os.path.dirname(config.file), exist_ok=True)
 
     config.git = o.git
 
     config.save()
 
     if config.git:
+        # add a gitignore file to skip gitdir
         if (Path(config.gitdir)/'.git').exists():
             logger.warning(f'{config.gitdir} is already initialized')
         else:
             os.makedirs(config.gitdir, exist_ok=True)
             config.gitcmd('init')
 
-
         if config.gitlfs:
             config.gitcmd('lfs track "files/"')
             config.gitcmd('add .gitattributes')
+            config.gitcmd(f'commit -m "papers install: .gitattribute"', check=False)
 
-        with open(Path(config.gitdir)/'.gitignore', 'a+') as f:
-            lines = f.readlines()
-            if 'futures.txt' not in (l.strip() for l in lines):
-                f.write('futures.txt\n')
-        config.gitcmd('add .gitignore')
-        config.gitcmd(f'add {os.path.abspath(config.file)}')
-        message = f'papers ' +' '.join(sys.argv[1:])
-        config.gitcmd(f'commit -m "new install: config file"', check=False)
         biblio = get_biblio(config)
         _backup_bib(biblio, config)
 
@@ -362,7 +485,7 @@ def _dir_is_empty(dir):
         return not any(it)
 
 def uninstallcmd(parser, o, config):
-    # TODO this is actually never tested.    
+    # TODO this is actually never tested.
     if Path(config.file).exists():
         logger.info(f"The uninstaller will now remove {config.file}")
         os.remove(config.file)
@@ -376,11 +499,11 @@ def uninstallcmd(parser, o, config):
         return
 
     if o.recursive:
-        config.file = search_config([CONFIG_FILE_LOCAL], start_dir=".", default=CONFIG_FILE)
+        config.file = search_config([CONFIG_FILE_LOCAL, os.path.join(".papers", "config.json")], start_dir=".", default=CONFIG_FILE)
         config.file = check_legacy_config(config.file)
         uninstallcmd(parser, o, config)
 
-def check_install(parser, o, config):
+def check_install(parser, o, config, bibtex_must_exist=True):
     """
     Given an option and config, checks to see if the install is done correctly on this filesystem.
     """
@@ -398,7 +521,8 @@ def check_install(parser, o, config):
         parser.print_help()
         print(f"--bibtex must be specified, or {install_doc}")
         raise PapersExit()
-    elif not os.path.exists(config.bibtex):
+
+    if bibtex_must_exist and not os.path.exists(config.bibtex):
         print(f'papers: error: no bibtex file found, do `touch {config.bibtex}` or {install_doc}')
         raise PapersExit()
     logger.info(f'bibtex: {config.bibtex!r}')
@@ -408,7 +532,7 @@ def check_install(parser, o, config):
 
 def addcmd(parser, o, config):
     """
-    Given an options set and a config, sets up the function call to add the file or dir to the bibtex, and executes it.
+    Given an options set and a config, sets up the function call to add the file or all files in the directory to the bibtex, and executes it.
     """
 
     set_nameformat_config_from_cmd(o, config)
@@ -416,47 +540,66 @@ def addcmd(parser, o, config):
 
     biblio = get_biblio(config)
 
-    kw = {'on_conflict':o.mode, 'check_duplicate':not o.no_check_duplicate,
-            'mergefiles':not o.no_merge_files, 'update_key':o.update_key}
+    entries = []
+
+    metadata = {k: v for k, v in o.metadata or []}
+    if o.doi: metadata['doi'] = o.doi
+    if o.key: metadata['ID'] = o.key
+    if o.title: metadata['title'] = o.title
+    if o.author: metadata['author'] = o.author
+    if o.journal: metadata['journal'] = o.journal
+    if o.year: metadata['year'] = o.year
+    if o.type: metadata['ENTRYTYPE'] = o.type
+    if "author" in metadata:
+        metadata["author"] = standard_name(metadata["author"])
+    if o.attachment:
+        metadata['file'] = format_file(biblio.get_files(metadata) + o.attachment, relative_to=biblio.relative_to)
 
     if len(o.file) > 1:
-        if o.attachment:
-            logger.error('--attachment is only valid for one PDF / BIBTEX entry')
-            raise PapersExit()
-        if o.doi:
-            logger.error('--doi is only valid for one added file')
+        if metadata:
+            logger.error('--doi, --metadata, --key, --attachment and other metadata keys are only valid for one PDF / BIBTEX entry')
             raise PapersExit()
 
-    if len(o.file) == 0:
-        if not o.doi:
-            logger.error('Please provide either a PDF file or BIBTEX entry or specify `--doi DOI`')
+    kw = {'on_conflict':o.mode, 'check_duplicate':not o.no_check_duplicate,
+            'mergefiles':not o.no_merge_files, 'update_key':o.update_key, 'metadata':metadata}
+
+    if len(o.file) == 0 and o.doi and not o.no_query_doi:
+        entries.extend( biblio.fetch_doi(o.doi, attachments=o.attachment, rename=o.rename, copy=o.copy, **kw) )
+
+    elif len(o.file) == 0:
+        if not o.edit and not o.metadata and not o.key and not o.doi and not o.attachment and not o.title and not o.author and not o.journal and not o.year:
+            logger.error("No entry added: use --doi, --metadata, --key, --attachment, --title, --author, --journal, --year to add a new entry")
             raise PapersExit()
-        elif o.no_query_doi:
-            logger.error('If no file is present, --no-query-doi is not compatible with --doi')
-            raise PapersExit()
-        else:
-            biblio.fetch_doi(o.doi, attachments=o.attachment, rename=o.rename, copy=o.copy, **kw)
+
+        metadata.setdefault('ID', biblio.keyformat(metadata))
+        metadata.setdefault('ENTRYTYPE', 'article')
+        if o.edit:
+            metadata = edit_entries(metadata)
+            o.edit = False
+
+        entries.extend( biblio.insert_entry(metadata, **kw) )
+
 
     for file in o.file:
         try:
             if os.path.isdir(file):
                 if o.recursive:
-                    biblio.scan_dir(file, rename=o.rename, copy=o.copy,
+                    entries.extend( biblio.scan_dir(file, rename=o.rename, copy=o.copy,
                                 search_doi=not o.no_query_doi,
                                 search_fulltext=not o.no_query_fulltext,
-                                **kw)
+                                **kw) )
                 else:
                     raise ValueError(file+' is a directory, requires --recursive to explore')
-                
+
             elif file.endswith('.pdf'):
-                biblio.add_pdf(file, attachments=o.attachment, rename=o.rename, copy=o.copy,
+                entries.extend( biblio.add_pdf(file, attachments=o.attachment, rename=o.rename, copy=o.copy,
                            search_doi=not o.no_query_doi,
                            search_fulltext=not o.no_query_fulltext,
                            scholar=o.scholar, doi=o.doi,
-                           **kw)
+                           **kw) )
 
             else: # file.endswith('.bib'):
-                biblio.add_bibtex_file(file, **kw)
+                entries.extend( biblio.add_bibtex_file(file, attachments=o.attachment, rename=o.rename, copy=o.copy, **kw) )
 
         except Exception as error:
             # print(error)
@@ -468,13 +611,39 @@ def addcmd(parser, o, config):
                     logger.error('use --ignore to add other files anyway')
                 raise PapersExit()
 
+    # The list of new entries potentially contains duplicates if more than one file is added sequentially
+    # If action is required on the added entry, we need to make sure we're consistent with the biblio.
+    if len(entries) > 1 and (o.edit or o.open):
+        unique_keys = set(biblio.key(e) for e in entries)
+        entries = [e for e in biblio.entries if biblio.key(e) in unique_keys]
+
+    if o.edit:
+        entry_keys = [biblio.key(e) for e in entries]
+        otherentries = [e for e in biblio.entries if biblio.key(e) not in entry_keys]
+
+        try:
+            entries = edit_entries(entries)
+        except Exception as error:
+            logger.error(str(error))
+            return
+
+        entries = [{k:v for k,v in e.items() if v != ""} for e in entries]
+        biblio.db.entries = otherentries + entries
+
     savebib(biblio, config)
 
+    if o.open:
+        for e in entries:
+            view_entry_files(biblio, e)
+
 def checkcmd(parser, o, config):
+    """
+    Loops over the entire bib file that the Papers install sees, and checks each entry for formatting and for the existance of duplicates.  Then writes the Biblio object back to your Bibtex file.
+    """
     set_keyformat_config_from_cmd(o, config)
 
     biblio = get_biblio(config)
-    
+
     # if o.fix_all:
     #     o.fix_doi = True
     #     o.fetch_all = True
@@ -505,21 +674,25 @@ def filecheckcmd(parser, o, config):
 
     if o.rename:
         biblio.rename_entries_files(o.copy)
-        
+
+    if o.clean_filesdir:
+        print("Check files directory for unlinked files")
+        clean_filesdir(biblio, interactive=not o.force, ignore_files=[config.bibtex])
+
     savebib(biblio, config)
 
 def redocmd(parser, o, config):
     if config.git:
-        return _git_redo(config)
+        return _git_redo(config, restore_files=o.restore_files, steps=o.steps)
     else:
         undocmd(parser, o, config)
 
 def undocmd(parser, o, config):
     if config.git:
-        return _git_undo(config)
+        return _git_undo(config, restore_files=o.restore_files, steps=o.steps)
 
     logger.warning("git-tracking is not installed: undo / redo is limited to 1 step back and forth")
-    back = backupfile(config.bibtex)
+    back = backupfile_func(config.bibtex)
     tmp = config.bibtex + '.tmp'
     # my = :config.bibtex, config.filesdir)
     logger.info(config.bibtex+' <==> '+back)
@@ -527,6 +700,16 @@ def undocmd(parser, o, config):
     shutil.move(back, config.bibtex)
     shutil.move(tmp, back)
     # o.savebib()
+
+def restorecmd(parser, o, config):
+    if not config.git:
+        parser.print_help()
+        raise PapersExit('only valid with --git enabled')
+    if o.ref:
+        _git_reset_to_commit(config, o.ref, restore_files=o.restore_files)
+    else:
+        _restore_from_backupdir(config, restore_files=o.restore_files)
+
 
 def gitcmd(parser, o, config):
     try:
@@ -537,10 +720,23 @@ def gitcmd(parser, o, config):
         parser.error('papers failed to execute git command -- you should check your system git install.')
 
 def doicmd(parser, o):
-    print(extract_pdf_doi(o.pdf, image=o.image))    
+    print(extract_pdf_doi(o.pdf, image=o.image))
 
 def fetchcmd(parser, o):
-    print(fetch_bibtex_by_doi(o.doi))
+    # either one or several DOIs
+    if all(isvaliddoi(field) for field in o.doi_or_text):
+        if o.scholar:
+            parser.error("Fetching from DOI does not support Google Scholar option")
+        for doi in o.doi_or_text:
+            print(fetch_bibtex_by_doi(doi))
+        return
+
+    # or one full text search
+    field = " ".join(o.doi_or_text)
+    if o.scholar:
+        print(fetch_bibtex_by_fulltext_scholar(field))
+    else:
+        print(fetch_bibtex_by_fulltext_crossref(field))
 
 def extractcmd(parser, o):
     print(extract_pdf_metadata(o.pdf, search_doi=not o.fulltext, search_fulltext=True, scholar=o.scholar, minwords=o.word_count, max_query_words=o.word_count, image=o.image))
@@ -647,15 +843,6 @@ def listcmd(parser, o, config):
         eq = lambda a, b: a['ID'] == b['ID'] or are_duplicates(a, b, similarity="PARTIAL", fuzzy_ratio=o.fuzzy_ratio)
         entries = list_dup(entries, eq=eq)
 
-    if o.no_key:
-        key = lambda e: ''
-    else:
-        # key = lambda e: bcolors.OKBLUE+e['ID']+filetag(e)+':'+bcolors.ENDC
-        key = lambda e: _nfiles(e)*(bcolors.BOLD)+bcolors.OKBLUE+e['ID']+':'+bcolors.ENDC
-
-    def parse_keywords(e):
-        return [w.strip() for w in e.get('keywords', '').split(',') if w.strip()]
-
     if o.add_keywords:
         for e in entries:
             keywords = parse_keywords(e)
@@ -663,6 +850,20 @@ def listcmd(parser, o, config):
                 if w not in keywords:
                     keywords.append(w)
             e['keywords'] = ", ".join(keywords)
+        savebib(biblio, config)
+
+    elif o.add_files:
+        if len(entries) != 1:
+            raise PapersExit("list only one entry to use --add-files")
+        e = entries[0]
+        files = biblio.get_files(e)
+        for f in o.add_files:
+            if not os.path.exists(f):
+                raise PapersExit(f"file {f} does not exist")
+        files.extend(o.add_files)
+        biblio.set_files(e, files)
+        if o.rename:
+            biblio.rename_entry_files(e, copy=o.copy)
         savebib(biblio, config)
 
     elif o.edit:
@@ -675,7 +876,7 @@ def listcmd(parser, o, config):
             return
 
         savebib(biblio, config)
-        
+
     elif o.fetch:
         for e in entries:
             biblio.fix_entry(e, fix_doi=True, fix_key=True, fetch_all=True, interactive=True)
@@ -686,33 +887,27 @@ def listcmd(parser, o, config):
             biblio.db.entries.remove(e)
         savebib(biblio, config)
 
+    elif o.open:
+        for e in entries:
+            view_entry_files(biblio, e)
+
     elif o.field:
         # entries = [{k:e[k] for k in e if k in o.field+['ID','ENTRYTYPE']} for e in entries]
         for e in entries:
-            print(key(e),*[e.get(k, "") for k in o.field])
+            print(format_key(e, no_key=o.no_key),*[e.get(k, "") for k in o.field])
     elif o.key_only:
         for e in entries:
             print(e['ID'])
     elif o.one_liner:
         for e in entries:
-            tit = e.get('title', '')[:60]+ ('...' if len(e.get('title', ''))>60 else '')
-            info = []
-            if e.get('doi',''):
-                info.append('doi:'+e['doi'])
-            n = _nfiles(e)
-            if n:
-                info.append(bcolors.OKGREEN+('files:' if n > 1 else 'file:')+str(n)+bcolors.ENDC)
-            if e.get('keywords',''):
-                keywords = parse_keywords(e)
-                info.append(bcolors.WARNING+" | ".join(keywords)+bcolors.ENDC)
-            infotag = '('+', '.join(info)+')' if info else ''
-            print(key(e), tit, infotag)
+            print(format_entry(biblio, e, no_key=o.no_key))
+
     else:
         print(format_entries(entries))
 
+
 def statuscmd(parser, o, config):
     print(config.status(check_files=not o.no_check_files, verbose=o.verbose))
-    
 
 
 def get_parser(config=None):
@@ -848,8 +1043,15 @@ def get_parser(config=None):
     grp.add_argument('--ignore-errors', action='store_true',
         help='ignore errors when adding multiple files')
 
-    grp = addp.add_argument_group('pdf metadata')
+    grp = addp.add_argument_group('metadata')
     grp.add_argument('--doi', help='provide DOI -- skip parsing PDF')
+    grp.add_argument('--key', help='manually set the key')
+    grp.add_argument('--type', help='document type')
+    grp.add_argument('--title', help='manually set the title')
+    grp.add_argument('--author', help='manually set the author')
+    grp.add_argument('--journal', help='manually set the journal')
+    grp.add_argument('--year', help='manually set the year')
+    grp.add_argument('--metadata', nargs="+", metavar="KEY=VALUE", type=lambda meta: meta.split('=', 1), help='the metadata fields manually')
     grp.add_argument('--no-query-doi', action='store_true', help='do not attempt to parse and query doi')
     grp.add_argument('--no-query-fulltext', action='store_true', help='do not attempt to query fulltext in case doi query fails')
     grp.add_argument('--scholar', action='store_true', help='use google scholar instead of crossref')
@@ -860,6 +1062,10 @@ def get_parser(config=None):
         help='rename PDFs according to key')
     grp.add_argument('-c','--copy', action='store_true',
         help='copy file instead of moving them')
+
+    grp = addp.add_argument_group('actions')
+    grp.add_argument('-e', '--edit', action='store_true', help='edit entry')
+    grp.add_argument('-o', '--open', action='store_true', help='open files')
 
     # check
     # =====
@@ -916,6 +1122,9 @@ def get_parser(config=None):
     filecheckp.add_argument('-d', '--delete-broken', action='store_true',
         help='remove file entry if the file link is broken')
 
+    filecheckp.add_argument('--clean-filesdir', action='store_true',
+        help='remove files in filesdir if not referred to in any entry')
+
     filecheckp.add_argument('--fix-mendeley', action='store_true',
         help='fix a Mendeley bug where the leading "/" is omitted.')
 
@@ -930,7 +1139,7 @@ def get_parser(config=None):
 
     # list
     # ======
-    listp = subparsers.add_parser('list', description='list (a subset of) entries',
+    listp = subparsers.add_parser('list', description='list (a subset of) entries in the existing bib file',
         parents=[cfg])
 
     listp.add_argument('fullsearch', nargs='*', help='''Search field. Usually no quotes required. See keywords to search specific fields. All words must find a match, unless --any is passed.''')
@@ -966,6 +1175,7 @@ def get_parser(config=None):
 
     grp = listp.add_argument_group('formatting')
     mgrp = grp.add_mutually_exclusive_group()
+    mgrp.add_argument('--plain', action='store_false', dest="one_liner", help='print in bibtex format')
     mgrp.add_argument('-l', '-1', '--one-liner', action='store_true', help='one liner')
     mgrp.add_argument('--key-only', action='store_true')
     mgrp.add_argument('-f', '--field', nargs='+', help='specific field(s) only')
@@ -973,9 +1183,13 @@ def get_parser(config=None):
 
     grp = listp.add_argument_group('action on listed results (pipe)')
     grp.add_argument('--delete', action='store_true')
-    grp.add_argument('--edit', action='store_true', help='interactive edit text file with entries, and re-insert them')
+    grp.add_argument('-e', '--edit', action='store_true', help='interactive edit text file with entries, and re-insert them')
     grp.add_argument('--fetch', action='store_true', help='fetch and fix metadata')
     grp.add_argument('--add-keywords', '--add-tag', nargs='+', help='add keywords to the selected entries')
+    grp.add_argument('--add-files', nargs='+', help='add files to the selected entries (only one entry must be listed)')
+    grp.add_argument('--rename', action='store_true', help='rename added file(s) into files folder. Used together with --add-files')
+    grp.add_argument('--copy', action='store_true', help='copy added file(s) into files folder. Used together with --add-files --rename')
+    grp.add_argument('-o', '--open', action='store_true', help='open attachments (if any)')
 
     # grp.add_argument('--merge-duplicates', action='store_true')
 
@@ -988,9 +1202,9 @@ def get_parser(config=None):
 
     # fetch
     # =====
-    fetchp = subparsers.add_parser('fetch', description='fetch bibtex from DOI')
-    fetchp.add_argument('doi')
-
+    fetchp = subparsers.add_parser('fetch', description='fetch bibtex from DOI or full-text')
+    fetchp.add_argument('doi_or_text', nargs='+', help='DOI or full text.')
+    fetchp.add_argument('--scholar', action='store_true', help='use google scholar instead of default crossref for fulltext search')
 
     # extract
     # ========
@@ -1005,8 +1219,16 @@ def get_parser(config=None):
 
     # undo
     # ====
-    undop = subparsers.add_parser('undo', parents=[cfg], help='this command is modified and more powerful if git-tracking is enabled (infinite memory vs back-and-forth switch)')
-    redop = subparsers.add_parser('redo', parents=[cfg], help='this command is modified and more powerful if git-tracking is enabled (infinite memory vs back-and-forth switch)')
+    _restorep = argparse.ArgumentParser(add_help=False)
+    _restorep.add_argument('--restore-files', action='store_true', help='Use this option to restore files that have been renamed. By default the file link points to the back-up repository. This command has no effect without --git-lfs, and will result in broken file links.')
+
+    _stepsp = argparse.ArgumentParser(add_help=False)
+    _stepsp.add_argument('-n', '--steps', type=int, default=1, help='number of times undo/redo should be performed')
+
+    undop = subparsers.add_parser('undo', parents=[cfg, _restorep, _stepsp], help='Undo changes on bibtex (if --git is not enabled, only back and forth with last modification). If --git-lfs is enabled, the file entry may differ if it does not exist on disk any more, unless --restore-files was passed.')
+    redop = subparsers.add_parser('redo', parents=[cfg, _restorep, _stepsp], help='Redo changes on bibtex (if --git is not enabled, this has the same effect as papers undo)')
+    restorep = subparsers.add_parser('restore-backup', parents=[cfg, _restorep], help='Restore bibtex from backup. Also restore files if --restore-files if passed (--git-lfs only).')
+    restorep.add_argument('--ref', help='Optional: restore specific commit (execute `papers git whatchanged` to obtain appropriate reference)')
 
     # git
     # ===
@@ -1021,8 +1243,11 @@ def get_parser(config=None):
 
 def main(args=None):
     papers.config.DRYRUN = False  # reset in case main() if called directly
+    if args is not None:
+        # used in the commit message
+        sys.argv = sys.argv[:1] + args
 
-    configfile = search_config([CONFIG_FILE_LOCAL], start_dir=".", default=CONFIG_FILE)
+    configfile = search_config([CONFIG_FILE_LOCAL, os.path.join(".papers", "config.json")], start_dir=".", default=CONFIG_FILE)
     configfile = check_legacy_config(configfile)
     if not os.path.exists(configfile):
         config = Config()
@@ -1079,6 +1304,8 @@ def main(args=None):
         check_install(subp, o, config) and undocmd(subp, o, config)
     elif o.cmd == 'redo':
         check_install(subp, o, config) and redocmd(subp, o, config)
+    elif o.cmd == 'restore-backup':
+        check_install(subp, o, config, bibtex_must_exist=False) and restorecmd(subp, o, config)
     elif o.cmd == 'git':
         if not installed:
             subp.error('papers must be installed to use git command')
@@ -1099,10 +1326,17 @@ class PapersExit(Exception):
     pass
 
 
+def main_clean_exit(args=None):
+    try:
+        main(args)
+    except (PapersExit, DuplicateKeyError) as error:
+        if logger.getEffectiveLevel() == logging.DEBUG:
+            raise
+        if error.args:
+            logger.error(str(error))
+        sys.exit(1)
+
 if __name__ == "__main__":
     # we use try/except here to use a clean exit instead of trace
     # test and debugging may use main() directly for speed-up => better to avoid sys.exit there
-    try:
-        main()
-    except PapersExit:
-        sys.exit(1)
+    main_clean_exit()

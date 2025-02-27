@@ -1,7 +1,8 @@
 import os
 import bibtexparser
+from pathlib import Path
 from unidecode import unidecode as unicode_to_ascii
-from papers.latexenc import unicode_to_latex
+from papers.utils import ansi_link as link, bcolors
 from papers import logger
 
 # fix bibtexparser call on empty strings
@@ -88,6 +89,45 @@ def format_entries(entries):
     db = bibtexparser.bibdatabase.BibDatabase()
     db.entries.extend(entries)
     return bibtexparser.dumps(db)
+
+def parse_keywords(e):
+    return [w.strip() for w in e.get('keywords', '').split(',') if w.strip()]
+
+def format_key(e, no_key=False):
+    if no_key:
+        key = lambda e: ''
+    else:
+        n = len(parse_file(e.get('file','')))
+        key = lambda e: n*(bcolors.BOLD)+bcolors.OKBLUE+e['ID']+':'+bcolors.ENDC
+    return key(e)
+
+def format_entry(biblio, e, no_key=False, prefix=""):
+    """One-liner formatter
+    """
+    tit = e.get('title', '')[:60]+ ('...' if len(e.get('title', ''))>60 else '')
+    info = []
+    if e.get('doi',''):
+        info.append(link(f"https://doi.org/{e['doi']}", 'doi:'+e['doi']))
+
+    files = parse_file(e.get('file',''), relative_to=biblio.relative_to)
+    n = len(files)
+
+    if n:
+        file_link = f"file:///{Path(files[0]).resolve()}" if n == 1 else f"file:///{Path(os.path.commonpath(files)).resolve()}"
+        ansi_link = link(file_link, f'{"file" if n == 1 else "files"}:{str(n)}')
+        info.append(bcolors.OKGREEN+ansi_link+bcolors.ENDC)
+
+    if e.get('keywords',''):
+        keywords = parse_keywords(e)
+        info.append(bcolors.WARNING+" | ".join(keywords)+bcolors.ENDC)
+
+    infotag = '('+', '.join(info)+')' if info else ''
+    if prefix:
+        prefixtag = f"{bcolors.WARNING}{prefix} -> {bcolors.ENDC}"
+    else:
+        prefixtag = ""
+    return f"{prefixtag}{format_key(e, no_key=no_key)} {tit} {infotag}"
+
 
 # Parse name entry
 # ================

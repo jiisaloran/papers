@@ -11,7 +11,7 @@ from papers.bib import Biblio
 from tests.common import PAPERSCMD, paperscmd, prepare_paper, prepare_paper2, BibTest
 
 
-class TestAdd(unittest.TestCase):
+class TestAdd(BibTest):
 
     def setUp(self):
         self.pdf, self.doi, self.key, self.newkey, self.year, self.bibtex, self.file_rename = prepare_paper()
@@ -56,8 +56,8 @@ class TestAdd(unittest.TestCase):
         paperscmd(f'add --bibtex {self.mybib} {self.pdf}')
 
         file_ = self._checkbib(dismiss_key=True)
-        file = self._checkfile(file_)
-        self.assertEqual(file, self.pdf)
+        the_file = self._checkfile(file_)
+        self.assertEqual(the_file, self.pdf)
         # self.assertTrue(os.path.exists(self.pdf)) # old pdf still exists
 
 
@@ -80,6 +80,23 @@ class TestAdd(unittest.TestCase):
         self.assertEqual(file, os.path.join(self.filesdir, self.file_rename)) # update key since pdf
         self.assertTrue(os.path.exists(self.pdf)) # old pdf still exists
 
+    def test_add_rename_copy_journal(self):
+        '''
+        Tests that demanding a {journal} in the --name-template works.
+        Lightly begged/borrowed/stolen from the above test.
+        '''
+        paperscmd(f'add --rename --copy --name-template "{{journal}}/{{authorX}}_{{year}}_{{title}}" --name-title-sep - --name-author-sep _ --bibtex {self.mybib} --filesdir {self.filesdir} {self.pdf}') # need to escape the {} in f-strings by doubling those curly braces.
+
+        file_ = self._checkbib(dismiss_key=True)
+        the_file = self._checkfile(file_)
+        self.assertTrue(os.path.exists(self.pdf))
+        new_path = str(the_file).split(os.path.sep)
+        old_path = str(os.path.join(self.filesdir, self.file_rename)).split(os.path.sep)
+        self.assertEqual(old_path[-1], new_path[-1])
+        self.assertEqual(old_path[0], new_path[0])
+        db = bibtexparser.load(open(self.mybib))
+        journal = db.entries[0]['journal']
+        self.assertEqual(journal, new_path[-2]) #TODO a little gross, hardcoded
 
     def test_add_rename(self):
 
@@ -135,7 +152,7 @@ class TestAdd2(TestAdd):
         self.assertTrue(os.path.exists(self.si))
 
 
-class TestAddBib(unittest.TestCase):
+class TestAddBib(BibTest):
 
     def setUp(self):
         self.mybib = tempfile.mktemp(prefix='papers.bib')
@@ -196,7 +213,7 @@ class TestAddBib(unittest.TestCase):
             os.remove('.papersconfig.json')
 
 
-class TestAddDir(unittest.TestCase):
+class TestAddDir(BibTest):
 
     def setUp(self):
         self.pdf1, self.doi, self.key1, self.newkey1, self.year, self.bibtex1, self.file_rename1 = prepare_paper()
@@ -288,7 +305,7 @@ class TestAddConflict(BibTest):
  title = {Something else entirely}
 }"""
 
-    bibtex_conflict_key_fixed = """@article{Perrette_2011b,
+    bibtex_conflict_key_fixed = """@article{perrette_author0000,
  author = {M. Perrette and Another author},
  doi = {10.5194/bg-8-515-2011XXX},
  title = {Something else entirely}

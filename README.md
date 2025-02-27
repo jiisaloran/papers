@@ -1,8 +1,9 @@
-[![test](https://github.com/perrette/papers/workflows/CI/badge.svg)](https://github.com/perrette/papers/actions)
-[![python](https://img.shields.io/badge/python-3.8-blue.svg)]()
+[![test](https://github.com/perrette/papers/workflows/CI/badge.svg?query=branch%3Amaster)](https://github.com/perrette/papers/actions)
 [![python](https://img.shields.io/badge/python-3.9-blue.svg)]()
 [![python](https://img.shields.io/badge/python-3.10-blue.svg)]()
 [![python](https://img.shields.io/badge/python-3.11-blue.svg)]()
+[![python](https://img.shields.io/badge/python-3.12-blue.svg)]()
+[![python](https://img.shields.io/badge/python-3.13-blue.svg)]()
 
 # papers
 
@@ -14,7 +15,7 @@ That said, it is becoming useful :)
 ## Motivation
 
 This project is an attempt to create a light-weight,
-command-line bibliography managenent tool. Aims:
+command-line bibliography management tool. Aims:
 
 - maintain a PDF library (with appropriate naming)
 - maintain one or several bibtex-compatible collections, linked to PDFs
@@ -23,7 +24,7 @@ command-line bibliography managenent tool. Aims:
 
 ## Dependencies
 
-- python 3.8+
+- python 3.9+
 - [poppler-utils](https://en.wikipedia.org/wiki/Poppler_(software)) (only:`pdftotext`): convert PDF to text for parsing
 - [bibtexparser](https://bibtexparser.readthedocs.io) : parse bibtex files
 - [crossrefapi](https://github.com/fabiobatalha/crossrefapi) : make polite requests to crossref API
@@ -90,28 +91,36 @@ If you already know the DOI of a PDF, and don't want to gamble the fulltext sear
 The `add` command above also works without any PDF (create a bibtex entry without file attachment).
 
     papers add --doi 10.5194/esd-4-11-2013 --bibtex papers.bib
-    
+
+
+### Add entry without DOI from bibtex library + PDF
+
+Some old files don't have a DOI. Best is to add the entry from its bibtex:
+
+    papers add entry.bib --attachment esd-4-11-2013.pdf
+
+
 ### List entries (and edit etc...)
 
-Pretty listing (-1 or -l for one-liner listing, otherwise plain bibtex):
+Pretty listing by default (otherwise pass --plain for plain bibtex):
 
-    $> papers list -1
+    $> papers list
     Perrette2013: A scaling approach to project regional sea level rise and it... (doi:10.5194/esd-4-11-2013, file:1)
 
 Search with any number of keywords:
 
-    $> papers list perrette scaling approach sea level -1
+    $> papers list perrette scaling approach sea level
     ... (short list)
-    $> papers list perrette scaling approach sea level --any -1
+    $> papers list perrette scaling approach sea level --any
     ... (long list)
-    $> papers list --key perrette2013 --author perrette --year 2013 --title scaling approach sea level -1
+    $> papers list --key perrette2013 --author perrette --year 2013 --title scaling approach sea level
     ... (precise list)
 
 Add tags to view papers by topic:
 
-    $> papers list perrette2013 --add-tag sea-level projections -1
+    $> papers list perrette2013 --add-tag sea-level projections
     ...
-    $> papers list --tag sea-level projections -1
+    $> papers list --tag sea-level projections
     Perrette2013: A scaling approach to project regional sea level rise and it... (doi:10.5194/esd-4-11-2013, file:1, sea-level | projections )
 
 `papers list` is a powerful command, inspired from unix's `find` and `grep`.
@@ -193,7 +202,7 @@ Sometimes it is desirable to have separate configurations. In that case a local 
     Bibtex file name [default to existing: papers.bib] [Enter/Yes/No]:
     Files folder [default to new: papers] [Enter/Yes/No]: pdfs
     papers configuration
-    * configuration file: .papers/config.json
+    * configuration file: papersconfig.json
     * cache directory:    /home/perrette/.cache/papers
     * absolute paths:     True
     * git-tracked:        False
@@ -221,7 +230,7 @@ and remove the configuration file by hand (`rm ...`). Or use `papers uninstall` 
 
     papers uninstall
 
-You may repeat `papers status -v` and cleaning until a satistfying state is reached, or remove all config files recursively up to (and including) global install:
+You may repeat `papers status -v` and cleaning until a satisfying state is reached, or remove all config files recursively up to (and including) global install:
 
     papers uninstall --recursive
 
@@ -229,7 +238,7 @@ You may repeat `papers status -v` and cleaning until a satistfying state is reac
 ### Relative versus Absolute path
 
 By default, the file paths in the bibtex are stored as absolute paths (starting with `/`), except for local installs.
-It is possible to change this behavious explicitly during install or in a case by case basis with `--relative-paths` or `--absolute-paths` options.
+It is possible to change this behaviour explicitly during install or in a case by case basis with `--relative-paths` or `--absolute-paths` options.
 With or without install.
 
 
@@ -242,7 +251,7 @@ Simple cases are:
 In any other cases, you risk breaking the file links.
 
 Papers tries to be as little opinionated as possible about how files are organized, and so it relies on your own judgement and use case.
-When loading a bibtex, it always inteprete relative file links as being relative to the bibtex file.
+When loading a bibtex, it always interprete relative file links as being relative to the bibtex file.
 When saving a bibtex, it will save file links accordingly to the default setting path (usually absolute, unless local install or unless you specify otherwise).
 
 In any case, the following set of commands will always work provided the initial file links are valid (optional parameters in brackets):
@@ -278,6 +287,14 @@ That command is also convenient to check on what's actually tracked and what is 
     # ...
     papers filecheck --rename --filesdir files
 
+There is also a command specifically designed to clean up the zombie files and folders:
+
+    papers filecheck --clean-filesdir
+
+That command will ask before removig anything, unless `--force` is passed. Currently
+it ignores hidden files and folders, and will only consider folder that have a `.{folder}.bib` file inside, 
+which is the convention `papers` follows to store multiple attachments. That command works best
+when the files are in their own folder, and not mixed up with other things, obviously.
 
 ### Setup git-tracked library (optional)
 
@@ -293,14 +310,8 @@ If `--git-lfs` is passed, the files will be backed-up along with the bibtex.
 Under the hood, bibtex and files (if applicable) are copied (hard-linked) to a back-up directory.
 Details are described in [issue 51](https://github.com/perrette/papers/issues/51).
 
-In local installs, backup occurs in `.papers/`. In global installs, defaults to `~/.local/.share/papers`.
-Type `papers status -v` to find out.
-
+Backup occurs in a subfolder of `~/.local/.share/papers` regardless of the type of installation. Type `papers status -v` to find out.
 For local install that are already git-tracked, the feature remains useful as it is the basis for `papers undo` and `papers redo`.
-You might want to add `.papers` to your .gitignore to avoid messing up with your larger project.
-
-This feature is experimental.
-
 
 ### undo / redo
 

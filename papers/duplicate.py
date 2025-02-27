@@ -46,7 +46,7 @@ def groupby_equal(entries, eq=None):
         else:
             group = groups[k]
         group.append(e)
-    return sorted(groups.items()) 
+    return sorted(groups.items())
 
 
 def search_duplicates(entries, key=None, eq=None, issorted=False, filter_key=None):
@@ -341,7 +341,6 @@ def choose_entry_interactive(entries, extra=[], msg='', select=False, best=None)
     return _ask_pick_loop(entries, extra, select)
 
 
-
 def edit_entries(entries, diff=False, ndiff=False, editor=None):
     '''edit entries and insert result in database
     '''
@@ -367,12 +366,18 @@ def edit_entries(entries, diff=False, ndiff=False, editor=None):
 
     if res == 0:
         logger.info('sucessfully edited file, insert edited entries')
-        db = bibtexparser.loads(open(filename).read())
-        return db.entries
+        db_updated = bibtexparser.loads(open(filename).read())
+        keys_before = [e.get('ID') for e in entries]
+        keys_after = [e.get('ID') for e in db_updated.entries]
+        if set(keys_before) != set(keys_after):
+            print(f"{bcolors.WARNING}Keys edited ->", bcolors.OKBLUE ," ".join(sorted(set(keys_before).difference(keys_after))), bcolors.ENDC,
+                  "=>", bcolors.OKBLUE,
+                  " ".join(sorted(set(keys_after).difference(keys_before))), bcolors.ENDC) if keys_after else '(deleted)'
+        return db_updated.entries
 
-        raise ValueError('error when editing entries file: '+filename)
-
-
+    else:
+        logger.info('failed to edit file')
+        return db
 
 
 def score(e):
@@ -440,7 +445,7 @@ class DuplicateHandler:
             self.entries = [e]
 
         except Exception as error:
-            logger.warn(str(error))
+            logger.warning(str(error))
             best = self.best()
             for k in list(merged.keys()):
                 if isinstance(merged[k], ConflictingField):
@@ -580,9 +585,7 @@ def conflict_resolution_on_insert(old, new, mode='i'):
 (E)dit split (not a duplicate)
 (s)kip
 (a)ppend anyway
-(r)aise'''.strip()
-.replace('(u)','('+_colordiffline('u','+')+')')  # green lines will be added
-.replace('(o)','('+_colordiffline('o','-')+')') + bcolors.ENDC
+(r)aise'''.strip() + bcolors.ENDC
 )
 # .replace('(s)','('+_colordiffline('s','-')+')'))
         choices = list('uUoeEsar')
